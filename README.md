@@ -5,9 +5,9 @@ port — and, just as importantly, a record of what we learned getting it to a
 **reliable 200 Hz**.
 
 ```
-cargo run -- get
-cargo run -- set 40 --persist
-cargo run -- bench --hz 200 --secs 5
+cargo run -- get-hz
+cargo run -- set-hz 40 --persist
+cargo run -- bench --bin --hz 200
 ```
 
 ---
@@ -18,10 +18,11 @@ The goal was 200 Hz of accelerometer data. The obvious path (crank the baud to
 921600) turned out to be **the wrong one**. The right answer:
 
 > **Stay at the rock-solid 115200 baud and switch the device from its fat default
-> ASCII message to a compact _binary_ output. 200 Hz then uses ~5% of the link.**
+> ASCII message to a compact _binary_ output. 200 Hz then fits in under half the
+> link, where 200 Hz of the default ASCII message is ~2× over.**
 
-`bench` proves it on real hardware: **1000 frames in 5.00 s = 200.0 Hz**, every
-frame CRC-valid, ~52 kbit/s of the 1152 kbit/s a 115200 line provides.
+`bench --bin` proves it on real hardware: **1000 frames in 5.00 s = 200.0 Hz**,
+every frame CRC-valid, ~52 kbit/s of the ~115 kbit/s a 115200 line provides (~45%).
 
 ---
 
@@ -29,13 +30,17 @@ frame CRC-valid, ~52 kbit/s of the 1152 kbit/s a 115200 line provides.
 
 | Command | What it does |
 |---|---|
-| `get` | Read the async output rate (register 7). |
-| `set <HZ> [--persist]` | Write the async output rate. `--persist` saves to flash. |
+| `get-hz` | Read the async output rate (register 7). |
+| `set-hz <HZ> [--persist]` | Write the async output rate (validated). `--persist` saves to flash. |
 | `baud <NEW> [--persist]` | Change the device serial baud (register 5), switch this connection to it, and verify — without closing the port. |
+| `rrg <ID>` | Generic: read any register, print its fields. |
+| `wrg <ID> <P1> [P2 …]` | Generic: write any register. Sharp tool — e.g. `wrg 5 921600` bypasses the safe baud switch; use `baud`. |
+| `bench [--bin] [--hz HZ] [--secs S] [--fields LIST]` | Configure an output and **measure** the achieved rate, then restore. ASCII async by default; `--bin` selects a binary output (register 75); `--fields` picks the binary field set. |
 | `reset` | Reboot the sensor (`$VNRST`); reloads saved flash settings. |
 | `factory-reset` | Restore **all** registers to factory defaults and reboot (`$VNRFS`). Reverts to 115200 + default output. Not undoable. |
-| `bench [--hz HZ] [--secs S]` | Configure a compact binary output and **measure** the achieved frame rate, then restore prior state. |
 | `help` / `--help` / `-h` | Usage. |
+
+Binary `--fields` (Common group): `time, ypr, quat, gyro, accel, imu, magpres`.
 
 Global options: `--port PORT` (default `/dev/ttyUSB0`), `--baud BAUD` (default
 `115200` — this is the rate the **host** talks at; it must match the device's
@@ -44,6 +49,10 @@ Global options: `--port PORT` (default `/dev/ttyUSB0`), `--baud BAUD` (default
 ---
 
 ## VN-100 protocol primer
+
+> For the **authoritative** register/enum/field values this tool relies on — with
+> citations to the ICD (`../docs/`) and the vnsdk headers — see
+> [`REFERENCE.md`](REFERENCE.md).
 
 **ASCII commands** look like `$<payload>*XX\r\n`, where `XX` is the 8-bit XOR
 checksum of everything between `$` and `*`:
@@ -84,29 +93,30 @@ Our `bench` frame is Common group with **TimeStartup (`u64`, 8 B) + Accel
 - **Async output rate** (register 7): how often the device emits a message (Hz).
 - **Serial baud rate** (register 5): how fast bytes move on the wire.
 
-`set 40` changes the first; `baud 921600` changes the second; `--baud 921600` is
-just *the host connection speed* and changes **nothing** on the device.
+`set-hz 40` changes the first; `baud 921600` changes the second; `--baud 921600`
+is just *the host connection speed* and changes **nothing** on the device.
 
 ### 2. The VN-100 ships at 40 Hz, and "200 Hz" isn't a frequency limit — it's bandwidth
-The factory default async rate is **40 Hz**. Trying `set 100` or `set 200` at
-115200 returns `$VNERR,0C` = **"insufficient baud rate."** That's not "100 Hz is
-too fast" — it's "100 Hz × *this message's bytes* exceeds the link."
+The factory default async rate is **40 Hz**. Trying `set-hz 100` or `set-hz 200`
+at 115200 returns `$VNERR,0C` = **"insufficient baud rate."** That's not "100 Hz
+is too fast" — it's "100 Hz × *this message's bytes* exceeds the link."
 
 At 115200, 8N1 (~10 bits/byte) → ~**11,520 bytes/s** usable:
 
 | Message | Size | @ 200 Hz | Fits? |
 |---|---|---|---|
 | `VNYMR` (default ASCII) | ~115 B | ~23,000 B/s (~230 kbit/s) | ❌ ~2× over |
-| Compact binary (time+accel) | 26 B | 5,200 B/s (~52 kbit/s) | ✅ ~5% of link |
+| Compact binary (time+accel) | 26 B | 5,200 B/s (~52 kbit/s) | ✅ ~45% of link |
 
-This also explains the ladder we saw: `set 40` ✅, `set 50` ✅, `set 100` ❌
-(right at the wall), `set 200` ❌.
+This also explains the ladder we saw: `set-hz 40` ✅, `set-hz 50` ✅, `set-hz 100`
+❌ (right at the wall), `set-hz 200` ❌.
 
 ### 3. The fix: send *less per sample*, not push more baud
 ASCII presets that include acceleration are all big. **Binary output lets you
-pick exactly the fields you need** (timestamp + accel), so 200 Hz fits trivially
-at 115200. The compact 200 Hz binary stream uses **less bandwidth than the
-default 40 Hz ASCII** does today.
+pick exactly the fields you need** (e.g. timestamp + accel), so 200 Hz fits at
+115200 with ~55% headroom. The win isn't fewer total bytes — 200 Hz of the 26-B
+binary frame (~52 kbit/s) is actually a touch *more* than 40 Hz of the ~115-B
+VNYMR (~46 kbit/s) — it's **5× the sample rate for comparable bandwidth**.
 
 ### 4. The 921600 detour was a dead end on this hardware — but *only* at 921600
 The USB adapter is an **FTDI FT232R**, which supports 921600 fine. Yet:
@@ -249,16 +259,15 @@ register 75 for binary) — which is exactly what `bench` does.
 ## The `bench` proof, annotated
 
 ```text
-$ cargo run -- bench --hz 200 --secs 5
-Current ASCII async rate: 40 Hz (will restore afterward).
-TX: $VNWRG,07,0*6D                       # silence the ASCII stream
-TX: $VNWRG,75,1,4,01,0101*70             # binary: Common[TimeStartup,Accel] @ 800/4 = 200 Hz
-Configured binary output: ... (divisor 4, 26 bytes/frame).
+$ cargo run -- bench --bin --hz 200 --secs 5
+TX: $VNWRG,75,1,4,01,0101*70             # binary: Common[time,accel] @ 800/4 = 200 Hz
+Configured binary output: Common["time", "accel"] @ 200 Hz (divisor 4, 26 B/frame).
+TX: $VNWRG,07,0*6D                       # silence the ASCII stream while measuring
 Measuring for 5s...
 
-Result: 1000 valid frames in 5.00s = 200.0 Hz (target 200 Hz).
-Sample frame: t=1718200006000 ns, accel = [9.264, -0.571, 1.095] m/s^2
-Wire throughput ~52 kbit/s of the 1152 kbit/s the 115200 link provides.
+Result: 1000 frames in 5.00s = 200.0 Hz (target 200 Hz).
+Sample: t=1718200006000 ns, accel=[9.264, -0.571, 1.095] m/s^2
+Wire throughput ~52 kbit/s = 45% of the 115.2 kbit/s 115200-baud link.
 Restored: binary output off, ASCII async back to 40 Hz.
 ```
 
@@ -279,8 +288,14 @@ Decoding that sample frame byte-for-byte:
 The Y value matches `fc.py`'s `Accel Y ≈ -0.6`, confirming the same channel.
 
 > **Note on the IMU base rate:** binary `rateDivisor` divides the VN-100's
-> internal **800 Hz** sample rate. `rateDivisor = 4` → 200 Hz. `--hz` must divide
-> 800 (e.g. 100, 200, 400).
+> internal **800 Hz** sample rate. `rateDivisor = 4` → 200 Hz. With `--bin`,
+> `--hz` must divide 800 (e.g. 100, 200, 400); for the ASCII async output it must
+> be one of the fixed register-7 values (`1,2,4,5,10,20,25,40,50,100,200`).
+>
+> **Pick the data with `--fields`** (binary only): e.g.
+> `bench --bin --hz 200 --fields time,accel,gyro,quat`. The device accepts or
+> rejects (`$VNERR,0C`) per its own bandwidth check, so you can map exactly what
+> fits a given baud. A richer frame may need a higher baud or a lower rate.
 
 ---
 

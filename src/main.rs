@@ -1,33 +1,128 @@
-//! Read or set the Async Data Output Frequency (register 7) on a VectorNav VN-100,
-//! and change the device's serial baud rate (register 5).
+//! `rdwr_vn100` — read and configure a VectorNav VN-100 IMU over serial.
 //!
 //! The VN-100 speaks an ASCII protocol over a serial port. Each command is
 //!
 //!     $<payload>*XX\r\n
 //!
 //! where `XX` is the 8-bit XOR checksum of every character of `<payload>`
-//! (i.e. everything between `$` and `*`).
+//! (i.e. everything between `$` and `*`). Replies echo the same form; binary
+//! outputs (register 75) use a packed frame ending in a 16-bit CRC instead.
 //!
-//! Read Register 7:   $VNRRG,07*XX        -> reply $VNRRG,07,<freq>*YY
-//! Write Register 7:  $VNWRG,07,<freq>*XX -> reply $VNWRG,07,<freq>*YY
-//! Write Register 5:  $VNWRG,05,<baud>*XX -> reply $VNWRG,05,<baud>*YY  (serial baud)
-//! Write Settings:    $VNWNV*XX           -> reply $VNWNV*YY            (save to flash)
-//! Error response:    $VNERR,<code>*XX
+//! Commands implemented here:
+//!   get-hz / set-hz       read/write the async output rate    (register 7)
+//!   baud                  change the serial baud rate          (register 5)
+//!   rrg / wrg             generic read/write of any register   ($VNRRG / $VNWRG)
+//!   bench                 configure an output (ASCII async by default, or a
+//!                         binary output with --bin) and measure the achieved
+//!                         rate, to see what fits a given baud
+//!   reset / factory-reset reboot / restore defaults            ($VNRST / $VNRFS)
 //!
-//! `<freq>` is the async output rate in Hz. The VN-100 has no command to query
-//! the allowable rates: the set is fixed in firmware (see `VALID_RATES`), and
-//! writing an out-of-range value returns a `$VNERR` response.
+//! Key VN messages:
+//!   $VNRRG,<id>*XX          -> $VNRRG,<id>,<f1>,...*YY   (read register)
+//!   $VNWRG,<id>,<f1>,...*XX  -> echo                     (write register)
+//!   $VNWNV*XX               -> $VNWNV*YY                 (save all to flash)
+//!   $VNERR,<code>*XX                                     (error; see error_description)
+//!
+//! The async output rate (register 7) is one of a fixed firmware set
+//! (`VALID_RATES`); a value that's out of range — or too much data for the
+//! current baud — returns a `$VNERR` (0x0C = insufficient baud rate).
+//!
+//! Register/enum/table values are cited to the ICD and vnsdk in REFERENCE.md.
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 /// Frequencies (Hz) the VN-100 accepts for the async data output rate.
+/// Authoritative: REFERENCE.md "Register 7" (ICD Reg 7; vnsdk AsyncOutputFreq::Adof).
 const VALID_RATES: &[u32] = &[1, 2, 4, 5, 10, 20, 25, 40, 50, 100, 200];
 
 /// Serial baud rates the VN-100 supports (register 5).
+/// Authoritative: REFERENCE.md "Register 5" (ICD Reg 5; vnsdk BaudRate::BaudRates).
 const VALID_BAUDS: &[u32] = &[
     9600, 19200, 38400, 57600, 115200, 128000, 230400, 460800, 921600,
 ];
+
+/// A selectable binary-output field (all from the "Common" group, group 1):
+/// CLI name, the group-1 bit it occupies, and its on-wire byte size.
+struct Field {
+    name: &'static str,
+    bit: u8,
+    size: usize,
+}
+
+/// The `--fields` vocabulary (Common group only — keeps the frame to one group).
+/// Authoritative: REFERENCE.md "Common Group" (ICD §2.2 Table 2.3).
+const FIELDS: &[Field] = &[
+    Field {
+        name: "time",
+        bit: 0,
+        size: 8,
+    }, // TimeStartup, u64 ns
+    Field {
+        name: "ypr",
+        bit: 3,
+        size: 12,
+    }, // YawPitchRoll, 3×f32 deg
+    Field {
+        name: "quat",
+        bit: 4,
+        size: 16,
+    }, // Quaternion, 4×f32
+    Field {
+        name: "gyro",
+        bit: 5,
+        size: 12,
+    }, // AngularRate, 3×f32 rad/s
+    Field {
+        name: "accel",
+        bit: 8,
+        size: 12,
+    }, // Accel, 3×f32 m/s^2
+    Field {
+        name: "imu",
+        bit: 9,
+        size: 24,
+    }, // uncomp Accel+Gyro, 6×f32
+    Field {
+        name: "magpres",
+        bit: 10,
+        size: 20,
+    }, // Mag(3×f32)+Temp+Pres
+];
+
+fn lookup_field(name: &str) -> Option<&'static Field> {
+    FIELDS.iter().find(|f| f.name == name)
+}
+
+fn field_names() -> String {
+    FIELDS.iter().map(|f| f.name).collect::<Vec<_>>().join(", ")
+}
+
+/// Parse a comma-separated `--fields` list into Common-group fields, ordered by
+/// bit (the order the device emits them), de-duplicated.
+fn parse_fields(list: &str) -> Result<Vec<&'static Field>, String> {
+    let mut out: Vec<&'static Field> = Vec::new();
+    for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let f = lookup_field(name)
+            .ok_or_else(|| format!("unknown field `{name}`; choose from {}", field_names()))?;
+        if !out.iter().any(|g| g.name == f.name) {
+            out.push(f);
+        }
+    }
+    if out.is_empty() {
+        return Err("--fields needs at least one field".into());
+    }
+    out.sort_by_key(|f| f.bit);
+    Ok(out)
+}
+
+/// Default binary field set: timestamp + acceleration.
+fn default_fields() -> Vec<&'static Field> {
+    vec![
+        lookup_field("time").unwrap(),
+        lookup_field("accel").unwrap(),
+    ]
+}
 
 /// Compute the VN-100 checksum: XOR of all bytes in `payload`.
 fn checksum(payload: &str) -> u8 {
@@ -59,6 +154,7 @@ fn verify_checksum(line: &str) -> Result<(), String> {
 }
 
 /// Human-readable description of a VN-100 system error code.
+/// Authoritative: REFERENCE.md "Error responses" (ICD §1; vnsdk Errors.hpp Error).
 fn error_description(code: u8) -> &'static str {
     match code {
         1 => "hard fault",
@@ -112,6 +208,73 @@ fn parse_reg07(line: &str) -> Option<u32> {
     freq.trim().parse().ok()
 }
 
+/// Parse register 6 (Async Data Output Type / ADOR) value from a reply.
+fn parse_reg06(line: &str) -> Option<u8> {
+    let body = line
+        .strip_prefix("$VNRRG,06,")
+        .or_else(|| line.strip_prefix("$VNWRG,06,"))?;
+    body.split('*').next()?.trim().parse().ok()
+}
+
+/// ASCII async message presets (register 6 ADOR): CLI name -> register value.
+/// Authoritative: REFERENCE.md "Register 6" (ICD §3.2.3 Table 3.6;
+/// vnsdk AsyncOutputType::Ador).
+const ASCII_TYPES: &[(&str, u8)] = &[
+    ("off", 0),
+    ("ypr", 1),
+    ("qtn", 2),
+    ("qmr", 8),
+    ("mag", 10),
+    ("acc", 11),
+    ("gyr", 12),
+    ("mar", 13),
+    ("ymr", 14), // the factory default
+    ("yba", 16),
+    ("yia", 17),
+    ("imu", 19),
+    ("dtv", 30),
+    ("hve", 34),
+];
+
+fn ascii_type_names() -> String {
+    ASCII_TYPES
+        .iter()
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve a `--type` name (case-insensitive, optional `vn` prefix) to its ADOR.
+fn parse_ascii_type(s: &str) -> Result<u8, String> {
+    let lower = s.trim().to_lowercase();
+    let key = lower.strip_prefix("vn").unwrap_or(&lower);
+    ASCII_TYPES
+        .iter()
+        .find(|(n, _)| *n == key)
+        .map(|(_, v)| *v)
+        .ok_or_else(|| {
+            format!(
+                "unknown ASCII type `{s}`; choose from {}",
+                ascii_type_names()
+            )
+        })
+}
+
+/// Display name for an ADOR value, e.g. 8 -> "VNYMR".
+fn ascii_type_name(value: u8) -> String {
+    ASCII_TYPES
+        .iter()
+        .find(|(_, v)| *v == value)
+        .map(|(n, _)| {
+            if *n == "off" {
+                "off".to_string()
+            } else {
+                format!("VN{}", n.to_uppercase())
+            }
+        })
+        .unwrap_or_else(|| format!("ADOR {value}"))
+}
+
 struct Config {
     port: String,
     baud: u32,
@@ -119,8 +282,8 @@ struct Config {
 
 enum Command {
     Help,
-    Get,
-    Set {
+    GetHz,
+    SetHz {
         hz: u32,
         persist: bool,
     },
@@ -130,59 +293,155 @@ enum Command {
     },
     Reset,
     FactoryReset,
-    /// Configure a compact binary output and measure the achieved frame rate.
+    /// Read any register (generic ASCII Read Register).
+    Rrg {
+        id: u8,
+    },
+    /// Write any register (generic ASCII Write Register).
+    Wrg {
+        id: u8,
+        params: Vec<String>,
+    },
+    /// Configure an output (ASCII async by default, or binary with `--bin`) and
+    /// measure the achieved rate, then restore prior state.
     Bench {
+        binary: bool,
         hz: u32,
         secs: u64,
+        fields: Vec<&'static Field>,
+        ascii_type: Option<u8>,
     },
 }
 
+/// Format one help row: a `label` and one-or-more wrapped description lines,
+/// aligned to a common description column. If the label is too wide, the
+/// description starts on the next line.
+fn help_row(label: &str, desc: &[&str]) -> String {
+    const COL: usize = 24; // label column width; description starts after it
+    let mut out = String::new();
+    if label.len() <= COL {
+        out.push_str(&format!("  {label:<COL$}{}\n", desc[0]));
+    } else {
+        out.push_str(&format!("  {label}\n"));
+        out.push_str(&format!("  {:<COL$}{}\n", "", desc[0]));
+    }
+    for cont in &desc[1..] {
+        out.push_str(&format!("  {:<COL$}{}\n", "", cont));
+    }
+    out
+}
+
 fn help_text() -> String {
-    format!(
-        "rdwr_vn100 - read/set the VN-100 async output rate (reg 7) and serial baud (reg 5)\n\n\
-         Usage:\n  \
-           rdwr_vn100 [--port PORT] [--baud BAUD] get\n  \
-           rdwr_vn100 [--port PORT] [--baud BAUD] set <HZ> [--persist]\n  \
-           rdwr_vn100 [--port PORT] [--baud BAUD] baud <NEW_BAUD> [--persist]\n  \
-           rdwr_vn100 [--port PORT] [--baud BAUD] reset\n  \
-           rdwr_vn100 [--port PORT] [--baud BAUD] factory-reset\n  \
-           rdwr_vn100 [--port PORT] [--baud BAUD] bench [--hz HZ] [--secs S]\n  \
-           rdwr_vn100 help | --help | -h\n\n\
-         Commands:\n  \
-           get             Read the current async output rate.\n  \
-           set <HZ>        Write the async output rate.\n  \
-           baud <NEW_BAUD> Change the device's serial baud rate (register 5), then\n  \
-                           switch this connection to it and verify, all without\n  \
-                           closing the port.\n  \
-           reset           Reboot the sensor ($VNRST); reloads saved flash settings.\n  \
-           factory-reset   Restore ALL registers to factory defaults and reboot\n  \
-                           ($VNRFS). Reverts baud to 115200 and async output to\n  \
-                           default. Not undoable.\n  \
-           bench           Configure a compact binary output (Common: TimeStartup +\n  \
-                           Accel) at HZ and measure the achieved frame rate, then\n  \
-                           restore prior state. Proves a high rate fits the link.\n\n\
-         Bench options:\n  \
-           --hz HZ      Target binary rate; must divide 800 (default 200).\n  \
-           --secs S     Measurement duration in seconds (default 5).\n\n\
-         Options:\n  \
-           --port PORT  Serial device (default: /dev/ttyUSB0)\n  \
-           --baud BAUD  Baud rate to talk to the device at NOW (default: 115200);\n  \
-                        must match the device's CURRENT rate.\n  \
-           --persist    Save settings to flash so they survive a power cycle\n  \
-                        (works with `set` and `baud`).\n\n\
-         Valid HZ:   {VALID_RATES:?}\n  \
-           Fixed in firmware; the VN-100 has no command to query them, and rejects\n  \
-           out-of-range values with a $VNERR response.\n\
-         Valid BAUD: {VALID_BAUDS:?}\n\n\
-         Note: a baud change is volatile — the device keeps it across host reconnects,\n  \
-           but a power cycle or reset reverts to the flash baud. Persist to keep it:\n    \
-             rdwr_vn100 baud 921600 --persist        # change + verify + save to flash\n    \
-             rdwr_vn100 --baud 921600 get            # device now boots at 921600\n\n\
-         Examples:\n  \
-           rdwr_vn100 get\n  \
-           rdwr_vn100 set 40 --persist\n  \
-           rdwr_vn100 --port /dev/ttyACM0 --baud 921600 get\n"
-    )
+    let mut s = String::new();
+    s.push_str("rdwr_vn100 - read/configure a VectorNav VN-100 over serial\n\n");
+    s.push_str("Usage: rdwr_vn100 [--port PORT] [--baud BAUD] <command> [args]\n\n");
+
+    s.push_str("Commands:\n");
+    s.push_str(&help_row(
+        "get-hz",
+        &["Read the async output rate (register 7)."],
+    ));
+    s.push_str(&help_row(
+        "set-hz <HZ> [--persist]",
+        &["Write the async output rate (validated)."],
+    ));
+    s.push_str(&help_row(
+        "baud <NEW> [--persist]",
+        &[
+            "Change serial baud (register 5); switch this",
+            "connection to it and verify, without closing",
+            "the port.",
+        ],
+    ));
+    s.push_str(&help_row(
+        "rrg <ID>",
+        &["Read any register; print its fields."],
+    ));
+    s.push_str(&help_row(
+        "wrg <ID> <P1> [P2...]",
+        &[
+            "Write any register. Sharp tool: e.g.",
+            "`wrg 5 921600` skips the safe baud switch —",
+            "use `baud` instead.",
+        ],
+    ));
+    s.push_str(&help_row(
+        "bench [--bin] [--hz HZ] [--secs S] [--fields LIST]",
+        &[
+            "Configure an output and measure the achieved",
+            "rate, then restore. ASCII async by default;",
+            "--bin selects a binary output (register 75).",
+        ],
+    ));
+    s.push_str(&help_row(
+        "reset | factory-reset",
+        &["Reboot / restore-to-defaults ($VNRST / $VNRFS)."],
+    ));
+    s.push_str(&help_row("help | --help | -h", &["Show this help."]));
+
+    s.push_str("\nBench options:\n");
+    s.push_str(&help_row(
+        "--bin",
+        &["Binary output (register 75) instead of ASCII async."],
+    ));
+    s.push_str(&help_row(
+        "--hz HZ",
+        &[
+            "Output rate (default 40). ASCII: a valid HZ below.",
+            "Binary: must divide 800 (up to 800; link may cap lower).",
+        ],
+    ));
+    s.push_str(&help_row(
+        "--secs S",
+        &["Measurement duration in seconds (default 5)."],
+    ));
+    s.push_str(&help_row(
+        "--fields L",
+        &[
+            "Binary only: comma-separated fields (default time,accel).",
+            &format!("Choices: {}", field_names()),
+        ],
+    ));
+    s.push_str(&help_row(
+        "--type NAME",
+        &[
+            "ASCII only: set the message preset (register 6) first.",
+            &format!("Choices: {}", ascii_type_names()),
+        ],
+    ));
+
+    s.push_str("\nGlobal options:\n");
+    s.push_str(&help_row(
+        "--port PORT",
+        &["Serial device (default: /dev/ttyUSB0)."],
+    ));
+    s.push_str(&help_row(
+        "--baud BAUD",
+        &[
+            "Baud to talk to the device NOW (default 115200);",
+            "must match the device's CURRENT rate.",
+        ],
+    ));
+    s.push_str(&help_row(
+        "--persist",
+        &["Save to flash so it survives a power cycle (set-hz, baud)."],
+    ));
+
+    s.push_str(&format!("\nValid HZ (ASCII / set-hz): {VALID_RATES:?}\n"));
+    s.push_str("  Fixed in firmware; the device rejects others with a $VNERR.\n");
+    s.push_str(&format!("Valid BAUD: {VALID_BAUDS:?}\n\n"));
+
+    s.push_str("Note: a baud change is volatile — the device keeps it across host\n");
+    s.push_str("      reconnects, but a power cycle or reset reverts to the flash\n");
+    s.push_str("      baud. Persist to keep it.\n\n");
+
+    s.push_str("Examples:\n");
+    s.push_str("  rdwr_vn100 get-hz\n");
+    s.push_str("  rdwr_vn100 set-hz 40 --persist\n");
+    s.push_str("  rdwr_vn100 rrg 1                      # model number\n");
+    s.push_str("  rdwr_vn100 bench --bin --hz 200 --fields time,accel,gyro,quat\n");
+    s.push_str("  rdwr_vn100 bench --hz 50              # ASCII async at 50 Hz\n");
+    s
 }
 
 /// Parse CLI args into a connection config and a command.
@@ -204,8 +463,11 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Command), 
     let mut port = "/dev/ttyUSB0".to_string();
     let mut baud = 115_200u32;
     let mut persist = false;
+    let mut binary = false;
     let mut hz: Option<u32> = None;
     let mut secs: Option<u64> = None;
+    let mut fields_arg: Option<String> = None;
+    let mut type_arg: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut args = args.into_iter();
@@ -220,6 +482,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Command), 
                     .map_err(|_| "--baud must be a number")?
             }
             "--persist" => persist = true,
+            "--bin" => binary = true,
             "--hz" => {
                 hz = Some(
                     args.next()
@@ -236,21 +499,23 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Command), 
                         .map_err(|_| "--secs must be a number")?,
                 )
             }
+            "--fields" => fields_arg = Some(args.next().ok_or("--fields requires a value")?),
+            "--type" => type_arg = Some(args.next().ok_or("--type requires a value")?),
             _ => positional.push(arg),
         }
     }
 
     let command = match positional.first().map(String::as_str) {
-        Some("get") => {
+        Some("get-hz") => {
             if persist {
-                return Err("--persist only applies to `set`".into());
+                return Err("--persist only applies to `set-hz`".into());
             }
-            Command::Get
+            Command::GetHz
         }
-        Some("set") => {
+        Some("set-hz") => {
             let hz: u32 = positional
                 .get(1)
-                .ok_or("set requires a frequency, e.g. `set 40`")?
+                .ok_or("set-hz requires a frequency, e.g. `set-hz 40`")?
                 .parse()
                 .map_err(|_| "frequency must be a number")?;
             if !VALID_RATES.contains(&hz) {
@@ -258,7 +523,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Command), 
                     "{hz} Hz is not valid; choose one of {VALID_RATES:?}"
                 ));
             }
-            Command::Set { hz, persist }
+            Command::SetHz { hz, persist }
         }
         Some("baud") => {
             let new_baud: u32 = positional
@@ -276,25 +541,87 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Command), 
                 persist,
             }
         }
+        Some("rrg") => {
+            let id: u8 = positional
+                .get(1)
+                .ok_or("rrg requires a register id, e.g. `rrg 1`")?
+                .parse()
+                .map_err(|_| "register id must be 0-255")?;
+            Command::Rrg { id }
+        }
+        Some("wrg") => {
+            let id: u8 = positional
+                .get(1)
+                .ok_or("wrg requires a register id, e.g. `wrg 7 40`")?
+                .parse()
+                .map_err(|_| "register id must be 0-255")?;
+            let params: Vec<String> = positional.iter().skip(2).cloned().collect();
+            if params.is_empty() {
+                return Err("wrg requires at least one value, e.g. `wrg 7 40`".into());
+            }
+            Command::Wrg { id, params }
+        }
         Some("reset") => Command::Reset,
         Some("factory-reset") => Command::FactoryReset,
         Some("bench") => {
-            let hz = hz.unwrap_or(200);
-            if hz == 0 || 800 % hz != 0 {
-                return Err(format!(
-                    "--hz {hz} invalid; the binary rate is 800/divisor, so HZ must divide 800 \
-                     (e.g. 100, 200, 400)"
-                ));
-            }
-            Command::Bench {
-                hz,
-                secs: secs.unwrap_or(5),
+            let hz = hz.unwrap_or(40);
+            let secs = secs.unwrap_or(5);
+            if binary {
+                if type_arg.is_some() {
+                    return Err(
+                        "--type only applies to the ASCII bench (binary picks data with --fields)"
+                            .into(),
+                    );
+                }
+                if hz == 0 || 800 % hz != 0 {
+                    return Err(format!(
+                        "--hz {hz} invalid for --bin; the binary rate is 800/divisor, so HZ must \
+                         divide 800 (e.g. 50, 100, 200, 400)"
+                    ));
+                }
+                let fields = match &fields_arg {
+                    Some(list) => parse_fields(list)?,
+                    None => default_fields(),
+                };
+                Command::Bench {
+                    binary: true,
+                    hz,
+                    secs,
+                    fields,
+                    ascii_type: None,
+                }
+            } else {
+                if fields_arg.is_some() {
+                    return Err(
+                        "--fields only applies with --bin (ASCII async uses preset messages, \
+                         not arbitrary fields)"
+                            .into(),
+                    );
+                }
+                let ascii_type = match &type_arg {
+                    Some(t) => Some(parse_ascii_type(t)?),
+                    None => None,
+                };
+                if !VALID_RATES.contains(&hz) {
+                    return Err(format!(
+                        "--hz {hz} not valid for the ASCII async output; choose one of \
+                         {VALID_RATES:?} (or use --bin)"
+                    ));
+                }
+                Command::Bench {
+                    binary: false,
+                    hz,
+                    secs,
+                    fields: Vec::new(),
+                    ascii_type,
+                }
             }
         }
         Some(other) => return Err(format!("unknown command `{other}`")),
         None => {
             return Err(
-                "missing command (`get`, `set`, `baud`, `reset`, `factory-reset`, or `help`)"
+                "missing command (`get-hz`, `set-hz`, `baud`, `rrg`, `wrg`, `bench`, `reset`, \
+                 `factory-reset`, or `help`)"
                     .into(),
             )
         }
@@ -461,7 +788,7 @@ fn send_reboot_command<S: Read + Write>(
 
 /// VectorNav 16-bit CRC (CRC-CCITT/XMODEM, the algorithm from their app note).
 /// A valid binary packet, run from the groups byte through the trailing CRC,
-/// produces 0.
+/// produces 0. Authoritative: REFERENCE.md "Framing & checksums" (ICD §1.4).
 fn vn_crc16(data: &[u8]) -> u16 {
     let mut crc: u16 = 0;
     for &b in data {
@@ -474,30 +801,94 @@ fn vn_crc16(data: &[u8]) -> u16 {
     crc
 }
 
-// Our bench binary frame: sync 0xFA, groups=0x01 (Common), fields=0x0101
-// (TimeStartup[8] + Accel[12]), then 2-byte CRC. Fixed layout => fixed length.
+// Binary frame: sync 0xFA, groups=0x01 (Common), one 16-bit field mask, the
+// selected fields' payload, then a 2-byte CRC. Length depends on the field set.
 const BENCH_SYNC: u8 = 0xFA;
 const BENCH_GROUPS: u8 = 0x01;
-const BENCH_FRAME_LEN: usize = 1 + 1 + 2 + 8 + 12 + 2; // = 26
+const BENCH_HEADER: usize = 1 + 1 + 2; // sync + groups + field mask
+const BENCH_CRC: usize = 2;
 
-/// One decoded sample: (timestamp_ns, accel_x, accel_y, accel_z).
-type AccelSample = (u64, f32, f32, f32);
+/// A measurement outcome: (count, total wire bytes, elapsed seconds, first sample).
+type Measured = (u64, u64, f64, Option<String>);
 
-/// Outcome of a binary-rate measurement.
-struct BenchResult {
-    frames: u64,
-    elapsed: f64,
-    sample: Option<AccelSample>,
+/// Read a little-endian f32 from `buf` at `off`.
+fn rd_f32(buf: &[u8], off: usize) -> f32 {
+    f32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
 
-/// Read the binary stream for `secs` seconds, counting CRC-valid frames.
-fn measure_binary<S: Read>(port: &mut S, secs: u64) -> std::io::Result<BenchResult> {
+/// Human-readable decode of the selected fields in one binary frame.
+fn decode_binary_sample(frame: &[u8], fields: &[&Field]) -> String {
+    let mut off = BENCH_HEADER;
+    let mut parts = Vec::new();
+    for f in fields {
+        let s = match f.name {
+            "time" => format!(
+                "t={} ns",
+                u64::from_le_bytes(frame[off..off + 8].try_into().unwrap())
+            ),
+            "ypr" => format!(
+                "ypr=[{:.2}, {:.2}, {:.2}] deg",
+                rd_f32(frame, off),
+                rd_f32(frame, off + 4),
+                rd_f32(frame, off + 8)
+            ),
+            "quat" => format!(
+                "quat=[{:.4}, {:.4}, {:.4}, {:.4}]",
+                rd_f32(frame, off),
+                rd_f32(frame, off + 4),
+                rd_f32(frame, off + 8),
+                rd_f32(frame, off + 12)
+            ),
+            "gyro" => format!(
+                "gyro=[{:.4}, {:.4}, {:.4}] rad/s",
+                rd_f32(frame, off),
+                rd_f32(frame, off + 4),
+                rd_f32(frame, off + 8)
+            ),
+            "accel" => format!(
+                "accel=[{:.3}, {:.3}, {:.3}] m/s^2",
+                rd_f32(frame, off),
+                rd_f32(frame, off + 4),
+                rd_f32(frame, off + 8)
+            ),
+            "imu" => format!(
+                "uncomp_accel=[{:.3}, {:.3}, {:.3}] uncomp_gyro=[{:.4}, {:.4}, {:.4}]",
+                rd_f32(frame, off),
+                rd_f32(frame, off + 4),
+                rd_f32(frame, off + 8),
+                rd_f32(frame, off + 12),
+                rd_f32(frame, off + 16),
+                rd_f32(frame, off + 20)
+            ),
+            "magpres" => format!(
+                "mag=[{:.3}, {:.3}, {:.3}] G temp={:.2} C pres={:.3} kPa",
+                rd_f32(frame, off),
+                rd_f32(frame, off + 4),
+                rd_f32(frame, off + 8),
+                rd_f32(frame, off + 12),
+                rd_f32(frame, off + 16)
+            ),
+            _ => "?".to_string(),
+        };
+        parts.push(s);
+        off += f.size;
+    }
+    parts.join(", ")
+}
+
+/// Measure binary frames of `frame_len` bytes for `secs`. Counts CRC-valid
+/// frames and captures the first frame's raw bytes for the caller to decode.
+fn measure_binary<S: Read>(
+    port: &mut S,
+    frame_len: usize,
+    secs: u64,
+) -> std::io::Result<(u64, u64, f64, Option<Vec<u8>>)> {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(secs);
     let mut buf = [0u8; 1024];
     let mut acc: Vec<u8> = Vec::new();
     let mut frames = 0u64;
-    let mut sample = None;
+    let mut first: Option<Vec<u8>> = None;
 
     while Instant::now() < deadline {
         match port.read(&mut buf) {
@@ -515,51 +906,144 @@ fn measure_binary<S: Read>(port: &mut S, secs: u64) -> std::io::Result<BenchResu
         }
 
         let mut i = 0;
-        while i + BENCH_FRAME_LEN <= acc.len() {
+        while i + frame_len <= acc.len() {
             if acc[i] != BENCH_SYNC || acc[i + 1] != BENCH_GROUPS {
                 i += 1;
                 continue;
             }
-            let frame = &acc[i..(i + BENCH_FRAME_LEN)];
+            let frame = &acc[i..i + frame_len];
             // CRC over everything after the sync byte (groups..payload..crc) == 0.
             if vn_crc16(&frame[1..]) == 0 {
                 frames += 1;
-                if sample.is_none() {
-                    let t = u64::from_le_bytes(frame[4..12].try_into().unwrap());
-                    let ax = f32::from_le_bytes(frame[12..16].try_into().unwrap());
-                    let ay = f32::from_le_bytes(frame[16..20].try_into().unwrap());
-                    let az = f32::from_le_bytes(frame[20..24].try_into().unwrap());
-                    sample = Some((t, ax, ay, az));
+                if first.is_none() {
+                    first = Some(frame.to_vec());
                 }
-                i += BENCH_FRAME_LEN;
+                i += frame_len;
             } else {
                 i += 1; // false sync (0xFA can appear in payload); resync
             }
         }
         acc.drain(0..i);
         if acc.len() > 8192 {
-            // Bound memory if we're somehow not finding frames.
-            let keep = acc.len() - BENCH_FRAME_LEN;
+            let keep = acc.len() - frame_len;
             acc.drain(0..keep);
         }
     }
 
-    Ok(BenchResult {
+    Ok((
         frames,
-        elapsed: start.elapsed().as_secs_f64(),
-        sample,
-    })
+        frames * frame_len as u64,
+        start.elapsed().as_secs_f64(),
+        first,
+    ))
 }
 
-/// Configure a compact binary output (Common: TimeStartup + Accel) at `hz`,
-/// measure the achieved frame rate for `secs`, then restore the prior state.
-fn run_bench<S: Read + Write>(
+/// True if `line` is an async data message (a `$VN...` line that isn't a command
+/// echo or error) with a valid checksum.
+fn is_async_line(line: &str) -> bool {
+    line.starts_with("$VN")
+        && !line.starts_with("$VNRRG")
+        && !line.starts_with("$VNWRG")
+        && !line.starts_with("$VNERR")
+        && verify_checksum(line).is_ok()
+}
+
+/// Measure ASCII async messages for `secs`: counts valid `$VN...` lines and
+/// their wire bytes, capturing the first as the sample.
+fn measure_ascii<S: Read>(port: &mut S, secs: u64) -> std::io::Result<Measured> {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(secs);
+    let mut buf = [0u8; 1024];
+    let mut line: Vec<u8> = Vec::new();
+    let mut msgs = 0u64;
+    let mut bytes = 0u64;
+    let mut sample = None;
+
+    while Instant::now() < deadline {
+        let n = match port.read(&mut buf) {
+            Ok(0) => continue,
+            Ok(n) => n,
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        for &b in &buf[..n] {
+            match b {
+                b'\n' => {
+                    let raw = String::from_utf8_lossy(&line);
+                    let cand = match raw.rfind('$') {
+                        Some(p) => raw[p..].trim(),
+                        None => raw.trim(),
+                    };
+                    if is_async_line(cand) {
+                        msgs += 1;
+                        bytes += cand.len() as u64 + 2; // + CRLF
+                        if sample.is_none() {
+                            sample = Some(cand.to_string());
+                        }
+                    }
+                    line.clear();
+                }
+                b'\r' => {}
+                _ => {
+                    line.push(b);
+                    if line.len() > 1024 {
+                        line.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((msgs, bytes, start.elapsed().as_secs_f64(), sample))
+}
+
+/// Print the shared bench result block (rate, sample, wire utilization).
+fn report_bench(unit: &str, target_hz: u32, m: Measured, baud: u32) {
+    let (count, bytes, elapsed, sample) = m;
+    let rate = if elapsed > 0.0 {
+        count as f64 / elapsed
+    } else {
+        0.0
+    };
+    println!("\nResult: {count} {unit} in {elapsed:.2}s = {rate:.1} Hz (target {target_hz} Hz).");
+    if let Some(s) = sample {
+        println!("Sample: {s}");
+    }
+    let bits = if elapsed > 0.0 {
+        bytes as f64 * 10.0 / elapsed
+    } else {
+        0.0
+    };
+    let pct = 100.0 * bits / baud as f64;
+    println!(
+        "Wire throughput ~{:.0} kbit/s = {:.0}% of the {:.1} kbit/s {baud}-baud link.",
+        bits / 1000.0,
+        pct,
+        baud as f64 / 1000.0
+    );
+}
+
+/// Configure a binary output (reg 75) with `fields` at `hz`, measure the frame
+/// rate for `secs`, then restore the prior state.
+fn bench_binary<S: Read + Write>(
     port: &mut S,
     baud: u32,
     hz: u32,
     secs: u64,
+    fields: &[&Field],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let divisor = 800 / hz; // device IMU base rate is 800 Hz
+    let mask: u16 = fields.iter().fold(0, |m, f| m | (1u16 << f.bit));
+    let payload: usize = fields.iter().map(|f| f.size).sum();
+    let frame_len = BENCH_HEADER + payload + BENCH_CRC;
+    let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
 
     // Remember the current ASCII async rate so we can put it back.
     let prev = transact_retry(
@@ -570,7 +1054,20 @@ fn run_bench<S: Read + Write>(
         "could not read current async rate",
     )?;
     let prev_hz = parse_reg07(&prev).unwrap();
-    println!("Current ASCII async rate: {prev_hz} Hz (will restore afterward).");
+
+    // Configure Binary Output 1 (reg 75) on serial1. A $VNERR here means the
+    // chosen fields+rate don't fit the current baud — nothing else has changed.
+    let cfg = format!("VNWRG,75,1,{divisor},01,{mask:04X}");
+    transact_retry(
+        port,
+        &build_command(&cfg),
+        5,
+        |l| l.starts_with("$VNWRG,75"),
+        "device did not accept the binary config (a $VNERR means it won't fit at this baud)",
+    )?;
+    println!(
+        "Configured binary output: Common{names:?} @ {hz} Hz (divisor {divisor}, {frame_len} B/frame)."
+    );
 
     // Silence the ASCII async output so we measure ONLY the binary stream.
     transact_retry(
@@ -581,57 +1078,15 @@ fn run_bench<S: Read + Write>(
         "could not disable ASCII async output",
     )?;
 
-    // Binary Output 1 (reg 75): serial1, divisor, Common group, TimeStartup+Accel.
-    let cfg = format!("VNWRG,75,1,{divisor},01,0101");
-    println!("TX config: ${cfg}*..");
-    transact_retry(
-        port,
-        &build_command(&cfg),
-        5,
-        |l| l.starts_with("$VNWRG,75"),
-        "device did not accept the binary output config (a $VNERR here would mean it won't fit)",
-    )?;
-    println!(
-        "Configured binary output: Common[TimeStartup, Accel] @ {} Hz (divisor {divisor}, {} bytes/frame).",
-        800 / divisor,
-        BENCH_FRAME_LEN
-    );
-
-    // No explicit buffer flush here: the frame parser CRC-validates and resyncs,
-    // so the config echo and any partial leading bytes are simply skipped.
     println!("Measuring for {secs}s...");
-    let BenchResult {
-        frames,
-        elapsed,
-        sample,
-    } = measure_binary(port, secs)?;
-    let rate = if elapsed > 0.0 {
-        frames as f64 / elapsed
-    } else {
-        0.0
-    };
-
-    println!(
-        "\nResult: {frames} valid frames in {elapsed:.2}s = {rate:.1} Hz (target {} Hz).",
-        800 / divisor
-    );
-    if let Some((t, ax, ay, az)) = sample {
-        println!("Sample frame: t={t} ns, accel = [{ax:.3}, {ay:.3}, {az:.3}] m/s^2");
-    }
-    // ~10 bits/byte on the wire (8N1); baud == bits/s for UART.
-    let bits_per_sec = rate * BENCH_FRAME_LEN as f64 * 10.0;
-    let pct = 100.0 * bits_per_sec / baud as f64;
-    println!(
-        "Wire throughput ~{:.0} kbit/s = {:.0}% of the {:.1} kbit/s {baud}-baud link.",
-        bits_per_sec / 1000.0,
-        pct,
-        baud as f64 / 1000.0
-    );
+    let (frames, bytes, elapsed, first) = measure_binary(port, frame_len, secs)?;
+    let sample = first.map(|fr| decode_binary_sample(&fr, fields));
+    report_bench("frames", hz, (frames, bytes, elapsed, sample), baud);
 
     // Restore: turn the binary output off, put the ASCII rate back.
     let _ = transact_retry(
         port,
-        &build_command(&format!("VNWRG,75,0,{divisor},01,0101")),
+        &build_command(&format!("VNWRG,75,0,{divisor},01,{mask:04X}")),
         3,
         |l| l.starts_with("$VNWRG,75"),
         "restore: disable binary output",
@@ -653,6 +1108,108 @@ fn run_bench<S: Read + Write>(
         );
     }
     Ok(())
+}
+
+/// Set the ASCII async rate (reg 7) to `hz` — and optionally the message type
+/// (reg 6) — measure the message rate for `secs`, then restore prior state.
+fn bench_ascii<S: Read + Write>(
+    port: &mut S,
+    baud: u32,
+    hz: u32,
+    secs: u64,
+    ascii_type: Option<u8>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prev = transact_retry(
+        port,
+        &build_command("VNRRG,07"),
+        5,
+        |l| parse_reg07(l).is_some(),
+        "could not read current async rate",
+    )?;
+    let prev_hz = parse_reg07(&prev).unwrap();
+
+    // Optionally switch the ASCII message type (register 6), remembering the
+    // previous value to restore it.
+    let prev_type = if let Some(t) = ascii_type {
+        let r = transact_retry(
+            port,
+            &build_command("VNRRG,06"),
+            5,
+            |l| parse_reg06(l).is_some(),
+            "could not read current ASCII type",
+        )?;
+        let prev_t = parse_reg06(&r).unwrap();
+        transact_retry(
+            port,
+            &build_command(&format!("VNWRG,06,{t}")),
+            5,
+            |l| l.starts_with("$VNWRG,06"),
+            "device did not accept the ASCII type (register 6)",
+        )?;
+        println!("Set ASCII type to {} (ADOR {t}).", ascii_type_name(t));
+        Some(prev_t)
+    } else {
+        None
+    };
+
+    // A $VNERR here means the ASCII message doesn't fit at this baud/rate.
+    transact_retry(
+        port,
+        &build_command(&format!("VNWRG,07,{hz}")),
+        5,
+        |l| parse_reg07(l).is_some(),
+        "device did not accept the async rate (a $VNERR means the message won't fit at this baud)",
+    )?;
+    println!("Set ASCII async rate to {hz} Hz; measuring the $VN message stream for {secs}s...");
+
+    let measured = measure_ascii(port, secs)?;
+    let msgs = measured.0;
+    report_bench("messages", hz, measured, baud);
+
+    let _ = transact_retry(
+        port,
+        &build_command(&format!("VNWRG,07,{prev_hz}")),
+        3,
+        |l| parse_reg07(l).is_some(),
+        "restore: ASCII async rate",
+    );
+    if let Some(pt) = prev_type {
+        let _ = transact_retry(
+            port,
+            &build_command(&format!("VNWRG,06,{pt}")),
+            3,
+            |l| l.starts_with("$VNWRG,06"),
+            "restore: ASCII type",
+        );
+        println!(
+            "Restored: ASCII async back to {prev_hz} Hz, type {}.",
+            ascii_type_name(pt)
+        );
+    } else {
+        println!("Restored: ASCII async back to {prev_hz} Hz.");
+    }
+
+    if msgs == 0 {
+        return Err(
+            "received 0 async messages — is async output (register 6) on, or is the port wrong?"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Print the fields of a `$VN(R|W)RG,<id>,<f1>,<f2>...*XX` reply.
+fn print_reg_fields(reply: &str) {
+    let body = reply.trim_start_matches('$');
+    let body = body.split('*').next().unwrap_or(body);
+    let parts: Vec<&str> = body.split(',').collect();
+    match parts.as_slice() {
+        [_, id, fields @ ..] if !fields.is_empty() => {
+            println!("register {id}: {fields:?}");
+        }
+        [_, id] => println!("register {id}: (no fields)"),
+        _ => println!("(unrecognized reply)"),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -692,7 +1249,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Command::Help => unreachable!("handled above"),
 
-        Command::Get => {
+        Command::GetHz => {
             let reply = transact_retry(
                 &mut port,
                 &build_command("VNRRG,07"),
@@ -704,7 +1261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Async output rate: {} Hz", parse_reg07(&reply).unwrap());
         }
 
-        Command::Set { hz, persist } => {
+        Command::SetHz { hz, persist } => {
             let reply = transact_retry(
                 &mut port,
                 &build_command(&format!("VNWRG,07,{hz}")),
@@ -795,8 +1352,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Reset requested — sensor is rebooting and reloading its saved settings.");
         }
 
-        Command::Bench { hz, secs } => {
-            run_bench(&mut port, config.baud, hz, secs)?;
+        Command::Rrg { id } => {
+            let reply = transact_retry(
+                &mut port,
+                &build_command(&format!("VNRRG,{id:02}")),
+                5,
+                |l| l.starts_with("$VNRRG,"),
+                &no_reply,
+            )?;
+            println!("RX: {reply}");
+            print_reg_fields(&reply);
+        }
+
+        Command::Wrg { id, params } => {
+            let payload = format!("VNWRG,{id:02},{}", params.join(","));
+            let reply = transact_retry(
+                &mut port,
+                &build_command(&payload),
+                5,
+                |l| l.starts_with("$VNWRG,"),
+                &no_reply,
+            )?;
+            println!("RX: {reply}");
+            print_reg_fields(&reply);
+        }
+
+        Command::Bench {
+            binary,
+            hz,
+            secs,
+            fields,
+            ascii_type,
+        } => {
+            if binary {
+                bench_binary(&mut port, config.baud, hz, secs, &fields)?;
+            } else {
+                bench_ascii(&mut port, config.baud, hz, secs, ascii_type)?;
+            }
         }
 
         Command::FactoryReset => {
@@ -871,13 +1463,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_set_rate() {
-        let args = ["set", "33"].into_iter().map(String::from);
+        let args = ["set-hz", "33"].into_iter().map(String::from);
         assert!(parse_args(args).is_err());
     }
 
     #[test]
-    fn parses_flags_and_set_command() {
-        let args = ["--port", "/dev/ttyACM0", "--baud", "921600", "set", "40"]
+    fn parses_flags_and_set_hz_command() {
+        let args = ["--port", "/dev/ttyACM0", "--baud", "921600", "set-hz", "40"]
             .into_iter()
             .map(String::from);
         let (config, command) = parse_args(args).unwrap();
@@ -885,7 +1477,7 @@ mod tests {
         assert_eq!(config.baud, 921_600);
         assert!(matches!(
             command,
-            Command::Set {
+            Command::SetHz {
                 hz: 40,
                 persist: false
             }
@@ -893,12 +1485,12 @@ mod tests {
     }
 
     #[test]
-    fn set_with_persist_flag() {
-        let args = ["set", "40", "--persist"].into_iter().map(String::from);
+    fn set_hz_with_persist_flag() {
+        let args = ["set-hz", "40", "--persist"].into_iter().map(String::from);
         let (_, command) = parse_args(args).unwrap();
         assert!(matches!(
             command,
-            Command::Set {
+            Command::SetHz {
                 hz: 40,
                 persist: true
             }
@@ -906,9 +1498,65 @@ mod tests {
     }
 
     #[test]
-    fn persist_with_get_is_rejected() {
-        let args = ["get", "--persist"].into_iter().map(String::from);
+    fn persist_with_get_hz_is_rejected() {
+        let args = ["get-hz", "--persist"].into_iter().map(String::from);
         assert!(parse_args(args).is_err());
+    }
+
+    #[test]
+    fn parses_rrg_and_wrg() {
+        let (_, c) = parse_args(["rrg", "1"].into_iter().map(String::from)).unwrap();
+        assert!(matches!(c, Command::Rrg { id: 1 }));
+
+        let (_, c) = parse_args(["wrg", "7", "40"].into_iter().map(String::from)).unwrap();
+        match c {
+            Command::Wrg { id, params } => {
+                assert_eq!(id, 7);
+                assert_eq!(params, vec!["40".to_string()]);
+            }
+            _ => panic!("expected Wrg"),
+        }
+
+        // wrg needs at least one value
+        assert!(parse_args(["wrg", "7"].into_iter().map(String::from)).is_err());
+    }
+
+    #[test]
+    fn fields_parse_orders_by_bit_and_dedups() {
+        let f = parse_fields("accel,time,accel").unwrap();
+        let names: Vec<&str> = f.iter().map(|x| x.name).collect();
+        assert_eq!(names, vec!["time", "accel"]); // bit-ordered + de-duplicated
+        let mask: u16 = f.iter().fold(0, |m, x| m | (1u16 << x.bit));
+        assert_eq!(mask, 0x0101); // time bit0 + accel bit8 — matches the known config
+        assert!(parse_fields("bogus").is_err());
+    }
+
+    #[test]
+    fn parses_bench_bin_with_fields() {
+        let args = [
+            "bench",
+            "--bin",
+            "--hz",
+            "200",
+            "--fields",
+            "time,accel,gyro",
+        ]
+        .into_iter()
+        .map(String::from);
+        let (_, c) = parse_args(args).unwrap();
+        match c {
+            Command::Bench {
+                binary, hz, fields, ..
+            } => {
+                assert!(binary);
+                assert_eq!(hz, 200);
+                let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
+                assert_eq!(names, vec!["time", "gyro", "accel"]); // bits 0, 5, 8
+            }
+            _ => panic!("expected Bench"),
+        }
+        // --fields requires --bin
+        assert!(parse_args(["bench", "--fields", "time"].into_iter().map(String::from)).is_err());
     }
 
     #[test]
@@ -958,20 +1606,80 @@ mod tests {
     }
 
     #[test]
-    fn parses_bench_command() {
-        let args = ["bench", "--hz", "200", "--secs", "3"]
+    fn parses_bench_ascii_command() {
+        let args = ["bench", "--hz", "50", "--secs", "3"]
             .into_iter()
             .map(String::from);
         let (_, command) = parse_args(args).unwrap();
-        assert!(matches!(command, Command::Bench { hz: 200, secs: 3 }));
+        match command {
+            Command::Bench {
+                binary,
+                hz,
+                secs,
+                fields,
+                ascii_type,
+            } => {
+                assert!(!binary); // ASCII is the default
+                assert_eq!(hz, 50);
+                assert_eq!(secs, 3);
+                assert!(fields.is_empty());
+                assert_eq!(ascii_type, None);
+            }
+            _ => panic!("expected Bench"),
+        }
+    }
+
+    #[test]
+    fn parses_ascii_type() {
+        assert_eq!(parse_ascii_type("vnymr").unwrap(), 14); // ICD §3.2.3 / Ador::YMR
+        assert_eq!(parse_ascii_type("YMR").unwrap(), 14);
+        assert_eq!(parse_ascii_type("qtn").unwrap(), 2);
+        assert!(parse_ascii_type("bogus").is_err());
+
+        let (_, c) =
+            parse_args(["bench", "--type", "vnqtn"].into_iter().map(String::from)).unwrap();
+        match c {
+            Command::Bench {
+                binary, ascii_type, ..
+            } => {
+                assert!(!binary);
+                assert_eq!(ascii_type, Some(2));
+            }
+            _ => panic!("expected Bench"),
+        }
+
+        // --type with --bin is rejected.
+        assert!(parse_args(
+            ["bench", "--bin", "--type", "ymr"]
+                .into_iter()
+                .map(String::from)
+        )
+        .is_err());
     }
 
     #[test]
     fn bench_defaults_and_validation() {
+        // Bare bench: ASCII, 40 Hz, 5 s.
         let (_, command) = parse_args(["bench"].into_iter().map(String::from)).unwrap();
-        assert!(matches!(command, Command::Bench { hz: 200, secs: 5 }));
-        // 150 does not divide 800.
+        match command {
+            Command::Bench {
+                binary, hz, secs, ..
+            } => {
+                assert!(!binary);
+                assert_eq!(hz, 40);
+                assert_eq!(secs, 5);
+            }
+            _ => panic!("expected Bench"),
+        }
+        // 150 is not a valid ASCII async rate.
         assert!(parse_args(["bench", "--hz", "150"].into_iter().map(String::from)).is_err());
+        // 150 does not divide 800 for binary either.
+        assert!(parse_args(
+            ["bench", "--bin", "--hz", "150"]
+                .into_iter()
+                .map(String::from)
+        )
+        .is_err());
     }
 
     #[test]
