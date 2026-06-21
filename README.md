@@ -1,0 +1,220 @@
+# rdwr_vn100
+
+A small Rust CLI to read and configure a **VectorNav VN-100** IMU over a serial
+port — and, just as importantly, a record of what we learned getting it to a
+**reliable 200 Hz**.
+
+```
+cargo run -- get
+cargo run -- set 40 --persist
+cargo run -- bench --hz 200 --secs 5
+```
+
+---
+
+## TL;DR — the headline finding
+
+The goal was 200 Hz of accelerometer data. The obvious path (crank the baud to
+921600) turned out to be **the wrong one**. The right answer:
+
+> **Stay at the rock-solid 115200 baud and switch the device from its fat default
+> ASCII message to a compact _binary_ output. 200 Hz then uses ~5% of the link.**
+
+`bench` proves it on real hardware: **1000 frames in 5.00 s = 200.0 Hz**, every
+frame CRC-valid, ~52 kbit/s of the 1152 kbit/s a 115200 line provides.
+
+---
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `get` | Read the async output rate (register 7). |
+| `set <HZ> [--persist]` | Write the async output rate. `--persist` saves to flash. |
+| `baud <NEW> [--persist]` | Change the device serial baud (register 5), switch this connection to it, and verify — without closing the port. |
+| `reset` | Reboot the sensor (`$VNRST`); reloads saved flash settings. |
+| `factory-reset` | Restore **all** registers to factory defaults and reboot (`$VNRFS`). Reverts to 115200 + default output. Not undoable. |
+| `bench [--hz HZ] [--secs S]` | Configure a compact binary output and **measure** the achieved frame rate, then restore prior state. |
+| `help` / `--help` / `-h` | Usage. |
+
+Global options: `--port PORT` (default `/dev/ttyUSB0`), `--baud BAUD` (default
+`115200` — this is the rate the **host** talks at; it must match the device's
+*current* rate).
+
+---
+
+## VN-100 protocol primer
+
+**ASCII commands** look like `$<payload>*XX\r\n`, where `XX` is the 8-bit XOR
+checksum of everything between `$` and `*`:
+
+```
+Read register 7:    $VNRRG,07*74          -> $VNRRG,07,40*5C
+Write register 7:   $VNWRG,07,40*59       -> $VNWRG,07,40*59
+Write register 5:   $VNWRG,05,921600*53   (serial baud)
+Write binary out:   $VNWRG,75,1,4,01,0101 (register 75, see below)
+Save to flash:      $VNWNV*57             (writes ALL current registers)
+Reboot:             $VNRST*4D
+Factory reset:      $VNRFS*5F
+Error reply:        $VNERR,<code>*XX
+```
+
+**Binary output** (configured via register 75) is a packed frame:
+
+```
+0xFA | groups | field-mask(s) | payload… | CRC16
+```
+
+- `0xFA` = sync byte.
+- `groups` = bitmask of which field groups follow (`0x01` = the "Common" group).
+- one 16-bit `field-mask` per group, little-endian.
+- payload = the selected fields, in bit order, little-endian (`u64` time,
+  `f32` floats).
+- CRC16 = VectorNav's CRC-CCITT/XMODEM. A valid frame, run from the `groups`
+  byte through the trailing CRC, produces **0**.
+
+Our `bench` frame is Common group with **TimeStartup (`u64`, 8 B) + Accel
+(`3×f32`, 12 B)** → `1+1+2+8+12+2 = 26 bytes`.
+
+---
+
+## What we learned (the useful part)
+
+### 1. "Rate" is overloaded — there are two of them
+- **Async output rate** (register 7): how often the device emits a message (Hz).
+- **Serial baud rate** (register 5): how fast bytes move on the wire.
+
+`set 40` changes the first; `baud 921600` changes the second; `--baud 921600` is
+just *the host connection speed* and changes **nothing** on the device.
+
+### 2. The VN-100 ships at 40 Hz, and "200 Hz" isn't a frequency limit — it's bandwidth
+The factory default async rate is **40 Hz**. Trying `set 100` or `set 200` at
+115200 returns `$VNERR,0C` = **"insufficient baud rate."** That's not "100 Hz is
+too fast" — it's "100 Hz × *this message's bytes* exceeds the link."
+
+At 115200, 8N1 (~10 bits/byte) → ~**11,520 bytes/s** usable:
+
+| Message | Size | @ 200 Hz | Fits? |
+|---|---|---|---|
+| `VNYMR` (default ASCII) | ~115 B | ~23,000 B/s (~230 kbit/s) | ❌ ~2× over |
+| Compact binary (time+accel) | 26 B | 5,200 B/s (~52 kbit/s) | ✅ ~5% of link |
+
+This also explains the ladder we saw: `set 40` ✅, `set 50` ✅, `set 100` ❌
+(right at the wall), `set 200` ❌.
+
+### 3. The fix: send *less per sample*, not push more baud
+ASCII presets that include acceleration are all big. **Binary output lets you
+pick exactly the fields you need** (timestamp + accel), so 200 Hz fits trivially
+at 115200. The compact 200 Hz binary stream uses **less bandwidth than the
+default 40 Hz ASCII** does today.
+
+### 4. The 921600 detour was a dead end on this hardware
+The USB adapter is an **FTDI FT232R**, which supports 921600 fine. But:
+- A **volatile** baud change (no `--persist`) that switched in-process *verified*
+  at 921600 — yet once the port closed and a fresh process reopened, the device's
+  UART ended up **wedged and silent at every baud**, needing a **power cycle**.
+  (Independently reproduced with pyserial, so it wasn't this tool's bug.)
+- Lesson: don't rely on volatile high-baud changes across process boundaries.
+  If you truly need 921600, **persist it** so the device *boots* there — or do it
+  inside one managed session (the vendor SDK's `changeBaudRate` handles the
+  reopen). For our goal, none of that was necessary.
+
+### 5. Talking to a streaming device needs a robust reader
+Real serial I/O bites you in small ways we hit and fixed:
+- A read returning `Ok(0)` or `TimedOut` is **not EOF** — keep waiting until an
+  overall deadline. (Treating `Ok(0)` as EOF dropped slightly-late replies.)
+- A fresh open (especially at high baud) can lose the **first** query while the
+  USB chip settles — so commands **retry** (with a short settle + input flush).
+- Frames split across USB reads — accumulate into a buffer and resync on a bad
+  CRC (the sync byte can appear inside payload data).
+
+### 6. VNERR codes are worth decoding
+The tool maps `$VNERR,<hex>` to text (e.g. `0x0C` → "insufficient baud rate")
+with a hint, instead of leaving you to look it up.
+
+### 7. Why `../fc/src/fc.py` only ever saw 40 Hz
+Its `VecNavHandler` uses the SDK's `autoConnect()` (which probes baud rates and
+finds the device at its default 115200) and **never writes the output rate** to
+the device — the `rate=200` / `baudrate=921600` constructor args are effectively
+no-ops. So the device just streams its 40 Hz default and the host paces reads.
+To get 200 Hz, *something* has to configure the device (register 7 for ASCII, or
+register 75 for binary) — which is exactly what `bench` does.
+
+---
+
+## The `bench` proof, annotated
+
+```text
+$ cargo run -- bench --hz 200 --secs 5
+Current ASCII async rate: 40 Hz (will restore afterward).
+TX: $VNWRG,07,0*6D                       # silence the ASCII stream
+TX: $VNWRG,75,1,4,01,0101*70             # binary: Common[TimeStartup,Accel] @ 800/4 = 200 Hz
+Configured binary output: ... (divisor 4, 26 bytes/frame).
+Measuring for 5s...
+
+Result: 1000 valid frames in 5.00s = 200.0 Hz (target 200 Hz).
+Sample frame: t=1718200006000 ns, accel = [9.264, -0.571, 1.095] m/s^2
+Wire throughput ~52 kbit/s of the 1152 kbit/s the 115200 link provides.
+Restored: binary output off, ASCII async back to 40 Hz.
+```
+
+Decoding that sample frame byte-for-byte:
+
+| Offset | Bytes | Field | Value |
+|---|---|---|---|
+| 0 | `FA` | sync | — |
+| 1 | `01` | groups | Common group present |
+| 2–3 | `01 01` | field mask `0x0101` LE | TimeStartup(bit0)+Accel(bit8) |
+| 4–11 | `70 75 B3 0C 90 01 00 00` | `u64` LE | 1,718,200,006,000 ns ≈ **1718 s uptime** |
+| 12–15 | `58 39 14 41` | `f32` LE | Accel X = **9.264** m/s² |
+| 16–19 | … | `f32` LE | Accel Y = **−0.571** m/s² |
+| 20–23 | … | `f32` LE | Accel Z = **1.095** m/s² |
+| 24–25 | CRC16 | — | whole-frame CRC = 0 |
+
+`|accel|` ≈ 9.35 m/s² ≈ g — a stationary IMU measuring gravity, mostly along +X.
+The Y value matches `fc.py`'s `Accel Y ≈ -0.6`, confirming the same channel.
+
+> **Note on the IMU base rate:** binary `rateDivisor` divides the VN-100's
+> internal **800 Hz** sample rate. `rateDivisor = 4` → 200 Hz. `--hz` must divide
+> 800 (e.g. 100, 200, 400).
+
+---
+
+## Recovering a confused device
+
+- **`reset`** — reboot, keep saved settings.
+- **`factory-reset`** — wipe to factory defaults (back to 115200 + default
+  output). Issue it at the device's *current* baud.
+- **Power cycle** — reloads flash; clears a wedged UART. (Note: a power cycle does
+  **not** restore factory defaults — it reloads whatever is in flash.)
+
+Nothing in this session was persisted, so a power cycle always returned the
+device to a clean 115200 / 40 Hz.
+
+---
+
+## Build & test
+
+```
+cargo build
+cargo test        # 22 unit tests, no hardware required
+cargo run -- help
+```
+
+Dependency: [`serialport`](https://crates.io/crates/serialport).
+
+Source is a single `src/main.rs`. Notable pieces: `checksum`/`verify_checksum`
+(ASCII), `vn_crc16` (binary), `transact`/`transact_retry` (robust request/reply),
+`read_reply` (deadline-bounded line reader), `measure_binary` + `run_bench`
+(the rate proof).
+
+---
+
+## Where this is headed
+
+We are **not** planning to modify `fc.py`. The likely next step is a separate
+project — **`fcbr`** ("flight controller, binary, Rust") — that reads the VN-100
+via this **binary** path in Rust, reusing the frame/CRC handling proven here,
+instead of the Python SDK. Before building on the 200 Hz result, it's still worth
+cross-checking it with an independent reader (the vendor SDK and/or a from-scratch
+pyserial parser).
