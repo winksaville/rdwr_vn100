@@ -189,7 +189,52 @@ Landed as one commit (cycle 0.2.0):
   bare on the Pi: `get-hz` 40 Hz, binary `accel,gyro` 199.9 Hz.
 
 
+## fix: bench silences async before binary config
+
+Commits:
+
+`bench --bin` could reject a binary config with `$VNERR` 0x0C
+("insufficient baud rate") at a low baud even when the binary stream
+fits the link with room to spare. The cause was write ordering:
+bench configured the binary output (reg 75) while ASCII async (reg
+7) was still streaming, so the device's fit check saw the *combined*
+ASCII + binary load. The fix silences ASCII async before writing the
+binary config, so the check sees only the binary load.
+
+### Bench combined-load fit check at low baud
+
+Observed 2026-06-26 on the RPi5 TTL header (`/dev/ttyAMA0`) running
+`bench --bin` after an in-session baud switch to 57600:
+
+- At 57600 with ASCII async still at 40 Hz, `VNWRG,75,2,20,01,0101`
+  (time+accel, 26 B/frame, 40 Hz) was rejected with `$VNERR` 0x0C.
+- The binary stream alone is ~10 kbit/s — 18% of the 57600 link —
+  so it fits easily; only the transient ASCII-40 + binary-40
+  combination overran the check.
+- Lowering ASCII async to 4 Hz first, then re-running the identical
+  bench, the same `VNWRG,75` was accepted and streamed clean at
+  39.9 Hz. Only the ASCII rate changed, isolating the combined load
+  as the cause.
+
+We think the device enforces `message_size × rate ≤ baud` on every
+reg-5 / reg-7 / reg-75 write, against the *sum* of the streams
+configured on that port. At 115200 the headroom hid the transient;
+at 57600 it surfaced. The ordering was always latent and only became
+visible at the lower baud.
+
+The fix reorders `bench_binary`:
+
+- Before: read reg 7 → write reg 75 → write reg 7=0. The fit check
+  fired on the reg-75 write, before ASCII was silenced.
+- After: read reg 7 → write reg 7=0 → write reg 75, and restore reg
+  7 if the reg-75 write still fails — so a genuinely-too-big binary
+  frame (e.g. the 38 B frame at 200 Hz / 115200, [[2]]) no longer
+  leaves ASCII async switched off.
+- `bench_ascii` is unaffected: it has a single stream and already
+  writes the message type (reg 6) before the rate (reg 7).
+
 # References
 
 [1]: /notes/bugs.md#issue-1--high-baud-reconnect-can-wedge-the-vn-100-uart
+[2]: /notes/chores/chores-01.md#200-hz-binary-frame-budget-at-115200
 

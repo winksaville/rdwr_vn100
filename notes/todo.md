@@ -14,7 +14,16 @@ by the "plan" — a bulleted list of the development "ladder":
    - 0.xx.y-2 blah blah blah
    - 0.xx.y close-out and validation
 
-_No cycle currently in progress._
+**fix: bench silences async before binary config (+ -V flag)**
+
+`bench --bin` rejects a binary config with `$VNERR` 0x0C at a low
+baud even when the binary stream fits, because it writes reg 75
+while ASCII async (reg 7) is still on, so the device's fit check
+sees the combined load. Silence ASCII async first. Also add a `-V`
+version flag and print the version as the first line of a bench.
+
+   - 0.2.1 fix bench async order; add -V flag + version line in
+     bench; edition 2024
 
 ## Todo
 

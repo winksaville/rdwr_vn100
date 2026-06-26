@@ -10,7 +10,7 @@ never reused or renumbered — so the heading doubles as a stable
 anchor (`#issue-N-…`) that todo / chores / commits can link to. The
 title may be reworded; the `issue-N` prefix of the anchor stays put.
 
-Next Issue #: 2
+Next Issue #: 3
 
 ## Bugs
 
@@ -74,6 +74,43 @@ ships, then wedges the IMU mid-flight with no recovery but cutting
 power. "Works sometimes" is not safe. Binary output already gives
 200 Hz at the rock-solid 115200, so there is no reason to chase a
 higher device baud.
+
+### Issue #2 — `read_reply` closure parameter named `matches` collides with the `matches!` macro
+
+In `read_reply` (`src/main.rs`), the predicate closure parameter is
+named `matches`, while the same function body uses the std `matches!`
+macro to classify a read error kind. Two unrelated things share the
+name in one scope:
+
+- `matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)` —
+  the standard-library macro (note the `!`), a pattern test on the
+  I/O error.
+- `matches(&candidate)` — the caller-supplied `FnMut(&str) -> bool`
+  closure that decides whether an assembled reply line is the one
+  we're waiting for. It is **not** an exact-equality test: every
+  call site passes a `starts_with` *prefix* predicate (e.g.
+  `|l| l.starts_with("$VNWRG,75")`), and `transact` further OR's in
+  a `$VNERR` prefix so a device-error reply also terminates the read
+  (`read_reply(port, deadline, |l| accept(l) || l.starts_with("$VNERR"))`).
+  `read_reply` slices `candidate` from the last `$` before testing,
+  so the prefix is anchored to the real reply, not stray leading
+  bytes.
+
+The closure threads through `transact_retry -> transact -> read_reply`
+as `impl Fn(&str) -> bool`. A reader scanning `read_reply` sees the
+`matches!(...)` macro first and reasonably assumes the later
+`matches(...)` is the same thing, when the actual closure invocation
+is the prefix-based line-acceptance test.
+
+- Proposed fix: rename the parameter (and its doc-comment mention) to
+  `is_acceptable` — it is a function parameter and call sites are
+  unaffected (the closure is passed positionally).
+- Pure readability defect: behavior is correct; the name collision
+  costs reader time and invites misreading.
+
+**Cost / why it matters:** no runtime impact, but `read_reply` is the
+core of every command's reply path, so the confusion tax is paid by
+anyone tracing how `GetHZ` (or any transact) reads a reply.
 
 # References
 

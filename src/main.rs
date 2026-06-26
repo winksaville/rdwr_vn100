@@ -300,6 +300,7 @@ struct Config {
 
 enum Command {
     Help,
+    Version,
     GetHz,
     SetHz {
         hz: u32,
@@ -400,6 +401,10 @@ fn help_text() -> String {
         &["Reboot / restore-to-defaults ($VNRST / $VNRFS)."],
     ));
     s.push_str(&help_row("help | --help | -h", &["Show this help."]));
+    s.push_str(&help_row(
+        "--version | -V",
+        &["Print the version and exit."],
+    ));
 
     s.push_str("\nBench options:\n");
     s.push_str(&help_row(
@@ -478,6 +483,11 @@ fn help_text() -> String {
     s
 }
 
+/// The `name version` banner line, e.g. `rdwr_vn100 0.2.1`.
+fn version_line() -> String {
+    format!("rdwr_vn100 {}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Parse CLI args into a connection config and a command.
 fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Command), String> {
     let args: Vec<String> = args.collect();
@@ -491,6 +501,18 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Command), 
                 baud: 0,
             },
             Command::Help,
+        ));
+    }
+    if args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--version" | "-V"))
+    {
+        return Ok((
+            Config {
+                port: String::new(),
+                baud: 0,
+            },
+            Command::Version,
         ));
     }
 
@@ -678,7 +700,7 @@ fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Command), 
                 "missing command (`get-hz`, `set-hz`, `baud`, `rrg`, `wrg`, `bench`, `reset`, \
                  `factory-reset`, or `help`)"
                     .into(),
-            )
+            );
         }
     };
 
@@ -719,7 +741,7 @@ where
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                continue
+                continue;
             }
             Err(e) => return Err(e),
         };
@@ -955,7 +977,7 @@ fn measure_binary<S: Read>(
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                continue
+                continue;
             }
             Err(e) => return Err(e),
         }
@@ -1024,7 +1046,7 @@ fn measure_ascii<S: Read>(port: &mut S, secs: u64) -> std::io::Result<Measured> 
                     std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
                 ) =>
             {
-                continue
+                continue;
             }
             Err(e) => return Err(e),
         };
@@ -1116,22 +1138,12 @@ fn bench_binary<S: Read + Write>(
     )?;
     let prev_hz = parse_reg07(&prev).unwrap();
 
-    // Configure Binary Output 1 (reg 75) on the chosen serial port(s). A $VNERR
-    // here means the chosen fields+rate don't fit the current baud — nothing
-    // else has changed.
-    let cfg = format!("VNWRG,75,{serial_port},{divisor},01,{mask:04X}");
-    transact_retry(
-        port,
-        &build_command(&cfg),
-        5,
-        |l| l.starts_with("$VNWRG,75"),
-        "device did not accept the binary config (a $VNERR means it won't fit at this baud)",
-    )?;
-    println!(
-        "Configured binary output: Common{names:?} @ {hz} Hz (divisor {divisor}, {frame_len} B/frame)."
-    );
-
-    // Silence the ASCII async output so we measure ONLY the binary stream.
+    // Silence the ASCII async output FIRST, before configuring the binary
+    // output. The device's fit check (message_size x rate <= baud) runs on the
+    // reg-75 write against the SUM of the streams on that port, so leaving ASCII
+    // async running can make the binary config fail with $VNERR 0x0C even when
+    // the binary stream fits the link on its own. Silencing first also means we
+    // measure ONLY the binary stream.
     transact_retry(
         port,
         &build_command("VNWRG,07,0"),
@@ -1139,6 +1151,31 @@ fn bench_binary<S: Read + Write>(
         |l| parse_reg07(l).is_some(),
         "could not disable ASCII async output",
     )?;
+
+    // Configure Binary Output 1 (reg 75) on the chosen serial port(s). A $VNERR
+    // here now means the binary stream alone won't fit the current baud. If the
+    // write fails, restore the ASCII async rate before bailing so we don't leave
+    // the device with async output switched off.
+    let cfg = format!("VNWRG,75,{serial_port},{divisor},01,{mask:04X}");
+    if let Err(e) = transact_retry(
+        port,
+        &build_command(&cfg),
+        5,
+        |l| l.starts_with("$VNWRG,75"),
+        "device did not accept the binary config (a $VNERR means it won't fit at this baud)",
+    ) {
+        let _ = transact_retry(
+            port,
+            &build_command(&format!("VNWRG,07,{prev_hz}")),
+            3,
+            |l| parse_reg07(l).is_some(),
+            "restore: ASCII async rate",
+        );
+        return Err(e);
+    }
+    println!(
+        "Configured binary output: Common{names:?} @ {hz} Hz (divisor {divisor}, {frame_len} B/frame)."
+    );
 
     println!("Measuring for {secs}s...");
     let (frames, bytes, elapsed, first) = measure_binary(port, frame_len, secs)?;
@@ -1289,6 +1326,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Command::Version = command {
+        println!("{}", version_line());
+        return Ok(());
+    }
+
+    // Stamp a bench run with the tool version as its first line, so a captured
+    // bench log records which build produced the numbers.
+    if let Command::Bench { .. } = command {
+        println!("{}", version_line());
+    }
+
     println!("Opening {} at {} baud...", config.port, config.baud);
     let mut port = serialport::new(&config.port, config.baud)
         // Short per-read timeout so read_reply re-checks its overall deadline often.
@@ -1309,7 +1357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     match command {
-        Command::Help => unreachable!("handled above"),
+        Command::Help | Command::Version => unreachable!("handled above"),
 
         Command::GetHz => {
             let reply = transact_retry(
@@ -1648,12 +1696,14 @@ mod tests {
         }
 
         // --serial-port requires --bin (ASCII targets the connected port).
-        assert!(parse_args(
-            ["bench", "--serial-port", "2"]
-                .into_iter()
-                .map(String::from)
-        )
-        .is_err());
+        assert!(
+            parse_args(
+                ["bench", "--serial-port", "2"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1748,12 +1798,14 @@ mod tests {
         }
 
         // --type with --bin is rejected.
-        assert!(parse_args(
-            ["bench", "--bin", "--type", "ymr"]
-                .into_iter()
-                .map(String::from)
-        )
-        .is_err());
+        assert!(
+            parse_args(
+                ["bench", "--bin", "--type", "ymr"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1773,12 +1825,14 @@ mod tests {
         // 150 is not a valid ASCII async rate.
         assert!(parse_args(["bench", "--hz", "150"].into_iter().map(String::from)).is_err());
         // 150 does not divide 800 for binary either.
-        assert!(parse_args(
-            ["bench", "--bin", "--hz", "150"]
-                .into_iter()
-                .map(String::from)
-        )
-        .is_err());
+        assert!(
+            parse_args(
+                ["bench", "--bin", "--hz", "150"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .is_err()
+        );
     }
 
     #[test]
