@@ -14,16 +14,35 @@ by the "plan" — a bulleted list of the development "ladder":
    - 0.xx.y-2 blah blah blah
    - 0.xx.y close-out and validation
 
-**fix: bench silences async before binary config (+ -V flag)**
+**feat: passive bench, composable command grammar**
 
-`bench --bin` rejects a binary config with `$VNERR` 0x0C at a low
-baud even when the binary stream fits, because it writes reg 75
-while ASCII async (reg 7) is still on, so the device's fit check
-sees the combined load. Silence ASCII async first. Also add a `-V`
-version flag and print the version as the first line of a bench.
+Today's `bench` mutates the device on every run
+(configure → measure → restore), conflating measurement with
+configuration, and reopens the port per subcommand — each reopen
+a wedge die-roll. Redesign `bench` to be purely passive,
+decompose config into composable `get-*`/`set-*` verbs, run a
+whole CLI line over a single connection, and add file-backed
+named states. Full design + rationale in chores-01 [[1]].
 
-   - 0.2.1 fix bench async order; add -V flag + version line in
-     bench; edition 2024
+   - 0.3.0-0 prep: land the design note + this entry. (done)
+   - 0.3.0-1 passive bench: `bench [SECS]` measures the live
+     stream only — drop the configure/measure/restore code;
+     ASCII line-count + byte throughput, binary rate via a
+     reg-75 read or `0xFA` sniff. Resolve the passive
+     binary-rate open question [[1]] here. (current)
+   - 0.3.0-2 decompose config verbs: add `get-ascii`/`set-ascii`
+     (reg 6) and `get-bin`/`set-bin` (reg 75) beside the
+     existing `get-hz`/`set-hz`; bare-enable semantics.
+   - 0.3.0-3 step grammar + one connection: shell-word steps,
+     `+` token join, single port open, left-to-right execution,
+     option-A resolve (merge `set-bin`+`set-hz` into one reg-75
+     write).
+   - 0.3.0-4 named states: `--config` TOML profile map;
+     `save-state` / `set-state` / `restore-state`; default =
+     bare-`restore-state` target, never auto-applied; baud
+     excluded from restore.
+   - 0.3.0 close-out: README + `--help` rewrite, validation
+     (cargo cycle), version bump.
 
 ## Todo
 
@@ -44,9 +63,12 @@ version flag and print the version as the first line of a bench.
 Completed tasks are moved from `## Todo` to here, `## Done`, as they are completed
 and older `## Done` sections are moved to [done.md](done.md) to keep this file small.
 
-- feat: default RPi5 UART, fix binary port on TTL [[1]],[[2]]
+- feat: default RPi5 UART, fix binary port on TTL [[2]],[[3]]
+- fix: bench silences async before binary config [[4]]
 
 # References
 
-[1]: chores/chores-01.md#vn-100-register-75-serial-port-numbering-on-ttl
-[2]: chores/chores-01.md#fix-binary-output-targets-the-wrong-vn-100-serial-port-on-ttl
+[1]: chores/chores-01.md#feat-passive-bench-composable-command-grammar
+[2]: chores/chores-01.md#vn-100-register-75-serial-port-numbering-on-ttl
+[3]: chores/chores-01.md#fix-binary-output-targets-the-wrong-vn-100-serial-port-on-ttl
+[4]: chores/chores-01.md#fix-bench-silences-async-before-binary-config

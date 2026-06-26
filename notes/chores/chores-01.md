@@ -8,7 +8,7 @@ with the why and how this task will be completed.
 
 ## docs: RS-232 wedge root cause + RPi5 TTL port plan
 
-Commits:
+Commits: [[3]]
 
 Benching the VN-100 baud climb wedged the device at 921600 —
 silent at every baud until a power cycle. The investigation traced
@@ -68,10 +68,113 @@ RS-232 levels, so there is no TTL logic-level mismatch.
   delivers 200 Hz, so high baud is not required for the flight
   goal — it is headroom, not a blocker.
 
+## feat: passive bench, composable command grammar
+
+Commits:
+
+Today's `bench` is too complex: every run *mutates* the device
+(configure → measure → restore), conflating measurement with
+configuration, and each subcommand is its own process — one port
+open per invocation, and each fresh-process reopen is a wedge
+die-roll [[1]]. The redesign makes `bench` purely passive, breaks
+configuration into composable `get-*`/`set-*` verbs, runs a whole
+CLI line over a single connection, and adds file-backed named
+states. We think running the line over one open cuts the
+reconnect count that Issue #1 ties to wedges.
+
+- **Passive bench.** `bench [SECS]` measures whatever is already
+  streaming — no device writes, no restore — default 5 s. This
+  removes the configure→measure→restore dance that is bench's
+  current bulk and its only wedge surface.
+- **Decomposed config verbs**, each owning one register concern:
+    - `get-hz` / `set-hz=<HZ>` — reg 7 async rate (exists today).
+    - `get-ascii` / `set-ascii=<MODE|off>` — reg 6 ASCII preset.
+    - `get-bin` / `set-bin=<FIELDS|off>` — reg 75 binary output.
+    - Bare `set-bin` enables binary with the *current* fields;
+      bare `set-ascii` enables ASCII with the current preset.
+- **One connection per invocation** — the whole line opens the
+  port once and runs its steps in order. See
+  [Step grammar](#step-grammar-joined-tokens-space-separated-steps).
+- **Universal rate.** `set-hz=N` is a desired rate independent of
+  output mode. See
+  [Universal rate (option A)](#universal-rate-option-a).
+- **File-backed named states.** A TOML config holds named
+  profiles. See [Named states](#named-states-file-backed--default).
+
+### Step grammar: +-joined tokens, space-separated steps
+
+The CLI line is one open connection and a sequence of steps. The
+grammar rides on shell word-splitting so there is no custom
+space handling.
+
+- Each shell *word* is one **step**; steps execute left-to-right.
+- Within a word, tokens joined by `+` apply together as one
+  atomic unit; multiple `set-*` in the same word merge into a
+  single device write.
+- Comma stays reserved for value-internal lists
+  (`set-bin=time,accel`); `+` is the only token joiner — never
+  comma — so the grammar stays unambiguous and flat (the
+  comma-nested alternative would make a value contain
+  sub-assignments, i.e. recursion).
+- Intra-step order is also left-to-right: `set-hz=50+bench` =
+  apply, then measure.
+- This unlocks a single-connection **sweep**:
+  `save-state set-hz=50+bench set-hz=100+bench set-hz=200+bench
+  restore-state` — snapshot, three configure-and-measure steps,
+  restore, all on one open.
+
+### Universal rate (option A)
+
+`set-hz=N` reads as one desired rate regardless of mode; the
+tool maps it to the right register.
+
+- ASCII: writes reg 7 directly.
+- Binary: the rate is the rateDivisor *inside* reg 75 (`800/N`),
+  the same register as the field mask — so `set-bin=…+set-hz=N`
+  must resolve to one combined reg-75 write. The `+`-join is what
+  makes that explicit: same word → one write.
+- Bare `set-bin` with no `set-hz` in the same step keeps the
+  device's current divisor.
+
+### Named states (file-backed) + default
+
+The `--config` file (default `./.rdwr_vn100-config.toml`, TOML,
+hand-editable) holds a map of named profiles plus a `default`
+key. Three verbs, three distinct jobs:
+
+- `save-state[=NAME]` — capture the current *device* regs into
+  NAME (or the default name).
+- `set-state=NAME+set-…` — define NAME from *explicit* values,
+  no device read.
+- `restore-state[=NAME]` — apply NAME (or the default when no
+  name) *to* the device.
+- `default` means only "the profile bare `restore-state` uses" —
+  **never** auto-applied. The tool stays passive by default;
+  nothing writes to the device unless a `set-*`/`restore-state`
+  verb asks. We think an auto-applied default would reintroduce
+  the surprise-mutation path Issue #1 [[1]] warns about.
+- The snapshot covers output config (reg 6 / 7 / 75). Baud
+  (reg 5) is excluded from restore by default, because rewriting
+  baud is itself the wedge trigger; `--baud` controls the link
+  instead.
+
+### Open questions (resolve before coding the relevant step)
+
+- `set-bin` and `set-ascii` both present on one line: error
+  ("pick one output to bench") vs measure both — leaning error.
+- Persist: apply volatile by default (reverts on power cycle,
+  matches today's bench), with `--persist` available.
+- `reset` / `factory-reset` reboot the device mid-line — constrain
+  them to standalone / last.
+- Passive binary frame-rate needs a frame length: reuse
+  `get-bin`'s reg-75 parser to self-configure, or sniff the
+  binary sync byte `0xFA`. v1 may report byte throughput +
+  ASCII line rate and add decoded binary rate via the reg-75 read.
+
 
 ## fix: binary output targets the wrong VN-100 serial port on TTL
 
-Commits:
+Commits: [[4]]
 
 First contact with the VN-100 from `rdwr_vn100` on the RPi5 flight
 target succeeded over the 3.3 V TTL header UART (`/dev/ttyAMA0`,
@@ -191,7 +294,7 @@ Landed as one commit (cycle 0.2.0):
 
 ## fix: bench silences async before binary config
 
-Commits:
+Commits: [[5]]
 
 `bench --bin` could reject a binary config with `$VNERR` 0x0C
 ("insufficient baud rate") at a low baud even when the binary stream
@@ -237,4 +340,7 @@ The fix reorders `bench_binary`:
 
 [1]: /notes/bugs.md#issue-1--high-baud-reconnect-can-wedge-the-vn-100-uart
 [2]: /notes/chores/chores-01.md#200-hz-binary-frame-budget-at-115200
+[3]: https://github.com/winksaville/rdwr_vn100/commit/656853ed17a2 "656853ed17a2c4a6f36b5e4cf9c1ca0dbaf0d570"
+[4]: https://github.com/winksaville/rdwr_vn100/commit/17d25b209c0c "17d25b209c0ca61aea3a8f84041bc7002226e78f"
+[5]: https://github.com/winksaville/rdwr_vn100/commit/49e72e583d47 "49e72e583d4787fb567357965081983d3ee9e60b"
 
