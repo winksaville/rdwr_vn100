@@ -24,20 +24,35 @@ decompose config into composable `get-*`/`set-*` verbs, run a
 whole CLI line over a single connection, and add file-backed
 named states. Full design + rationale in chores-01 [[1]].
 
+A code reorganization comes first: `main.rs` (~1890 lines) is
+split into a lib crate of focused modules, so the redesign's
+large new surface (verbs, step grammar, TOML config, named
+states) lands in clean modules instead of growing the monolith.
+Design + module layout in chores-01 [[5]].
+
    - 0.3.0-0 prep: land the design note + this entry. (done)
-   - 0.3.0-1 passive bench: `bench [SECS]` measures the live
+   - 0.3.0-1 refactor: add `lib.rs` + thin `main.rs`; move the
+     VN-100 protocol primitives (checksum/CRC, command framing,
+     register parsers, `Field`/`FIELDS`) to `proto.rs`. (done)
+   - 0.3.0-2 refactor: move port I/O (`read_reply`, `transact`,
+     `transact_retry`, `send_reboot_command`) to `transact.rs`.
+     (current)
+   - 0.3.0-3 refactor: move arg parsing, the `Command` enum, and
+     help text to `cli.rs`; scaffold `bench.rs`.
+   - 0.3.0-4 passive bench: `bench [SECS]` measures the live
      stream only — drop the configure/measure/restore code;
-     ASCII line-count + byte throughput, binary rate via a
-     reg-75 read or `0xFA` sniff. Resolve the passive
-     binary-rate open question [[1]] here. (current)
-   - 0.3.0-2 decompose config verbs: add `get-ascii`/`set-ascii`
+     ASCII line-count + binary frame rate via a `0xFA` sniff
+     (CRC-checked) + total wire throughput. Resolves the passive
+     binary-rate open question [[1]] (0xFA sniff). Lands in
+     `bench.rs`.
+   - 0.3.0-5 decompose config verbs: add `get-ascii`/`set-ascii`
      (reg 6) and `get-bin`/`set-bin` (reg 75) beside the
      existing `get-hz`/`set-hz`; bare-enable semantics.
-   - 0.3.0-3 step grammar + one connection: shell-word steps,
+   - 0.3.0-6 step grammar + one connection: shell-word steps,
      `+` token join, single port open, left-to-right execution,
      option-A resolve (merge `set-bin`+`set-hz` into one reg-75
      write).
-   - 0.3.0-4 named states: `--config` TOML profile map;
+   - 0.3.0-7 named states: `--config` TOML profile map;
      `save-state` / `set-state` / `restore-state`; default =
      bare-`restore-state` target, never auto-applied; baud
      excluded from restore.
@@ -72,3 +87,4 @@ and older `## Done` sections are moved to [done.md](done.md) to keep this file s
 [2]: chores/chores-01.md#vn-100-register-75-serial-port-numbering-on-ttl
 [3]: chores/chores-01.md#fix-binary-output-targets-the-wrong-vn-100-serial-port-on-ttl
 [4]: chores/chores-01.md#fix-bench-silences-async-before-binary-config
+[5]: chores/chores-01.md#refactor-split-mainrs-into-lib-modules

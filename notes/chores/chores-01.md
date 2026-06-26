@@ -70,7 +70,7 @@ RS-232 levels, so there is no TTL logic-level mismatch.
 
 ## feat: passive bench, composable command grammar
 
-Commits:
+Commits: [[6]]
 
 Today's `bench` is too complex: every run *mutates* the device
 (configure → measure → restore), conflating measurement with
@@ -170,6 +170,32 @@ key. Three verbs, three distinct jobs:
   `get-bin`'s reg-75 parser to self-configure, or sniff the
   binary sync byte `0xFA`. v1 may report byte throughput +
   ASCII line rate and add decoded binary rate via the reg-75 read.
+
+
+## refactor: split main.rs into lib modules
+
+Commits:
+
+`main.rs` had grown to ~1890 lines, and the 0.3.0 bench redesign
+adds a large new surface (the `get-*`/`set-*` verbs, the `+`-step
+grammar, a TOML config, named states). We split the monolith into
+a lib crate of focused modules first, so the new code lands in
+clean modules instead of growing the single file. Each step is a
+pure code-move — behavior unchanged, verified by the existing
+tests + clippy + a smoke run.
+
+- `proto.rs` — VN-100 protocol primitives: `checksum` /
+  `vn_crc16`, command framing (`build_command`,
+  `verify_checksum`), `error_description`, the register parsers,
+  and the `Field`/`FIELDS` binary-output vocabulary.
+- `transact.rs` — port I/O: `read_reply`, `transact`,
+  `transact_retry`, `send_reboot_command`.
+- `cli.rs` — `parse_args`, the `Command` enum, and help text.
+- `bench.rs` — the `bench` command (passive, built in 0.3.0-4).
+- `lib.rs` ties the modules together; `main.rs` is thin — parse
+  args, open the port, dispatch.
+- Ladder: proto (-1), transact (-2), cli + bench scaffold (-3);
+  one module per commit so each diff is a reviewable move.
 
 
 ## fix: binary output targets the wrong VN-100 serial port on TTL
@@ -343,4 +369,5 @@ The fix reorders `bench_binary`:
 [3]: https://github.com/winksaville/rdwr_vn100/commit/656853ed17a2 "656853ed17a2c4a6f36b5e4cf9c1ca0dbaf0d570"
 [4]: https://github.com/winksaville/rdwr_vn100/commit/17d25b209c0c "17d25b209c0ca61aea3a8f84041bc7002226e78f"
 [5]: https://github.com/winksaville/rdwr_vn100/commit/49e72e583d47 "49e72e583d4787fb567357965081983d3ee9e60b"
+[6]: https://github.com/winksaville/rdwr_vn100/commit/ec6c523d4991 "ec6c523d499125093f5e9a3daac60e145dffaf40"
 

@@ -23,6 +23,16 @@ the other (see [Cycle Protocol](#cycle-protocol) and
   and add its `ochid:` now, because `vc-x1 push` stamps only the
   topmost commit it pushes, never the ancestors.
 
+**What "commit" and "push" mean.** In an instruction, "commit",
+"push", and "commit + push" all mean `vc-x1 push` — land *and*
+publish — unless stated otherwise. A bare `jj commit` is asked for
+by name: "local commit", "save locally", "just `jj commit`" (the
+cases above). So the spoken default is publish; the local-only
+save is the named exception. The approval around a push —
+interactive by default, waived only by an explicit scoped
+delegation — is the cycle protocol's
+[Pushing policy](notes/cycle-protocol.md#policy).
+
 ## Repo Paths (relative from project root)
 
 - App repo: `.` (project root)
@@ -578,11 +588,14 @@ truth that AGENTS.md and cycle-protocol.md refer to
 abstractly.
 
 **Hard stop after push/finalize.** Once a push or `.claude`
-finalize is invoked (`vc-x1 push` does both), emit
-**nothing** — no tool call, no text, no verification, no
-summary — until the user speaks. Closing words go *before*
-the invoke; post-push verification happens next turn at the
-user's direction. See
+finalize is invoked (`vc-x1 push` does both), do no further
+work — no verification, no summary, no next-step offers —
+until the user speaks. Put all closing words *before* the
+invoke. The harness rejects an empty turn, so it may force a
+visible token after the tool returns; if so, emit a bare
+acknowledgment only (e.g. "landed") — never a summary or more
+work. Post-push verification happens next turn at the user's
+direction. See
 [After push or finalize](notes/cycle-protocol.md#after-push-or-finalize-stop-and-wait).
 
 **`vc-x1 push` behaviors to keep in mind.** Two, independent

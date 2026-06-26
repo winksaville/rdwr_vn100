@@ -337,6 +337,13 @@ continues past each push to the next step. Conditions:
   completion.
 - **Bounded goal** — covers the named task only; does not carry
   to the next task or a vaguer follow-on.
+- **Destructive ops still pause** — delegation covers the task's
+  ordinary commits and pushes; it does *not* pre-authorize a
+  genuinely irreversible action (force-push over published
+  history, history rewrite, deleting a remote branch). Those can
+  permanently destroy work and aren't a normal cycle step, so the
+  bot flags one before acting. An ordinary delegated cycle never
+  reaches this.
 - **Still transparent** — report each commit/push as it lands
   (title + outcome) so the user can catch up.
 - **When in doubt, ask** — ambiguous authorization falls back to
@@ -460,8 +467,10 @@ stop for the whole turn.
 `vc-x1 push` performs both as its tail stages — `push-app`
 then the detached `vc-x1 finalize` on `.claude` — so there is
 no gap left to speak in once the push is invoked. Put **all**
-closing words *before* invoking it; do not purposely emit anything
-after the tool returns.
+closing words *before* invoking it. The harness rejects an empty
+turn, so it may force a visible token after the tool returns; if
+so, emit a bare acknowledgment only (e.g. "landed") — never a
+summary, verification, or next-step offer.
 
 Why (`.claude` is the live journal finalize snapshots →
 squashes → pushes):
@@ -474,7 +483,9 @@ squashes → pushes):
   flush before the snapshot is taken. It is **not** time for
   the bot to do more work.
 - **silence**: the bot must not summarize or perform any work
-  after the tool returns.
+  after the tool returns. The harness may force a visible token
+  (it rejects an empty turn) — keep it to a bare acknowledgment,
+  never a summary or a next step.
 
 **Known slip**: the bot has emitted a summary after launching
 finalize. There is no "harmless" closing line — if it's worth
