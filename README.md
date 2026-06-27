@@ -1,4 +1,4 @@
-# rdwr_vn100
+# rw-vn100
 
 A small Rust CLI to read and configure a **VectorNav VN-100** IMU over a serial
 port — and, just as importantly, a record of what we learned getting it to a
@@ -147,7 +147,7 @@ unrecoverable failure that passes quick testing is the worst kind for flight, so
 the conclusion stands: **stay at 115200** (zero observed glitches; binary already
 gives 200 Hz there).
 
-Here's an example: three consecutive `rdwr_vn100` runs — 115200 (baseline), then
+Here's an example: three consecutive `rw-vn100` runs — 115200 (baseline), then
 921600 with a 1 s idle between gets, then 921600 with a 10 s idle. What changes
 between the two 921600 runs is the **idle, not the baud**. Each run starts from
 115200 (a power cycle reverts the volatile baud to the flash default).
@@ -155,8 +155,8 @@ between the two 921600 runs is the **idle, not the baud**. Each run starts from
 
 Here we use 115200:
 ```
-wink@3900x 26-06-21T16:47:23.024Z:~/data/prgs/nps-gnc/rdwr_vn100 (main+1)
-$ rdwr_vn100 baud 115200; rdwr_vn100 --baud 115200 get; sleep 3; rdwr_vn100 --baud 115200 get;
+wink@3900x 26-06-21T16:47:23.024Z:~/data/prgs/nps-gnc/rw-vn100 (main+1)
+$ rw-vn100 baud 115200; rw-vn100 --baud 115200 get; sleep 3; rw-vn100 --baud 115200 get;
 Opening /dev/ttyUSB0 at 115200 baud...
 TX: $VNWRG,05,115200*58
 RX: $VNWRG,05,115200*58
@@ -174,13 +174,13 @@ Opening /dev/ttyUSB0 at 115200 baud...
 TX: $VNRRG,07*74
 RX: $VNRRG,07,40*5C
 Async output rate: 40 Hz
-wink@3900x 26-06-21T16:48:12.480Z:~/data/prgs/nps-gnc/rdwr_vn100 (main+1)
+wink@3900x 26-06-21T16:48:12.480Z:~/data/prgs/nps-gnc/rw-vn100 (main+1)
 ```
 
 Here is 921600 with a sleep 1 between the 2nd and 3rd runs, works fine:
 ```
-wink@3900x 26-06-21T16:48:12.480Z:~/data/prgs/nps-gnc/rdwr_vn100 (main+1)
-$ rdwr_vn100 --baud 115200 baud 921600; rdwr_vn100 --baud 921600 get; sleep 1; rdwr_vn100 --baud 921600 get;
+wink@3900x 26-06-21T16:48:12.480Z:~/data/prgs/nps-gnc/rw-vn100 (main+1)
+$ rw-vn100 --baud 115200 baud 921600; rw-vn100 --baud 921600 get; sleep 1; rw-vn100 --baud 921600 get;
 Opening /dev/ttyUSB0 at 115200 baud...
 TX: $VNWRG,05,921600*53
 RX: $VNWRG,05,921600*53
@@ -198,14 +198,14 @@ Opening /dev/ttyUSB0 at 921600 baud...
 TX: $VNRRG,07*74
 RX: $VNRRG,07,40*5C
 Async output rate: 40 Hz
-wink@3900x 26-06-21T16:48:39.584Z:~/data/prgs/nps-gnc/rdwr_vn100 (main+1)
+wink@3900x 26-06-21T16:48:39.584Z:~/data/prgs/nps-gnc/rw-vn100 (main+1)
 ```
 
 Power-cycled (back to 115200), then changed to 921600 again — but now with a
 `sleep 10` between the gets. This fails: tried it 3 times, never worked.
 ```
-wink@3900x 26-06-21T16:48:39.584Z:~/data/prgs/nps-gnc/rdwr_vn100 (main+1)
-$ rdwr_vn100 --baud 115200 baud 921600; rdwr_vn100 --baud 921600 get; sleep 10; rdwr_vn100 --baud 921600 get;
+wink@3900x 26-06-21T16:48:39.584Z:~/data/prgs/nps-gnc/rw-vn100 (main+1)
+$ rw-vn100 --baud 115200 baud 921600; rw-vn100 --baud 921600 get; sleep 10; rw-vn100 --baud 921600 get;
 Opening /dev/ttyUSB0 at 115200 baud...
 TX: $VNWRG,05,921600*53
 RX: $VNWRG,05,921600*53
@@ -230,7 +230,7 @@ TX: $VNRRG,07*74
   attempt 4/5: no response yet, retrying...
 TX: $VNRRG,07*74
 Error: "no usable reply from device — is it actually at 921600 baud? (VN-100 factory default is 115200; use --baud to match, or the `baud` command to change it) (after 5 attempts; last: no reply yet)"
-wink@3900x 26-06-21T16:53:45.802Z:~/data/prgs/nps-gnc/rdwr_vn100 (main+1)
+wink@3900x 26-06-21T16:53:45.802Z:~/data/prgs/nps-gnc/rw-vn100 (main+1)
 ```
 
 ### 5. Talking to a streaming device needs a robust reader

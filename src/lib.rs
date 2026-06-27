@@ -1,4 +1,4 @@
-//! `rdwr_vn100` — read and configure a VectorNav VN-100 IMU over serial.
+//! `rw-vn100` — read and configure a VectorNav VN-100 IMU over serial.
 //!
 //! The VN-100 speaks an ASCII protocol over a serial port. Each command is
 //!

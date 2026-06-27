@@ -16,7 +16,7 @@ Next Issue #: 3
 
 ### Issue #1 — high-baud reconnect can wedge the VN-100 UART
 
-A cross-process reconnect (a fresh `rdwr_vn100` invocation opening
+A cross-process reconnect (a fresh `rw-vn100` invocation opening
 the port) at a high baud can wedge the VN-100's UART completely:
 afterward the device is silent at *every* baud, recoverable only
 by a power cycle. The failure is intermittent and probabilistic

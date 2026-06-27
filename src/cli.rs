@@ -156,8 +156,8 @@ fn help_row(label: &str, desc: &[&str]) -> String {
 
 pub fn help_text() -> String {
     let mut s = String::new();
-    s.push_str("rdwr_vn100 - read/configure a VectorNav VN-100 over serial\n\n");
-    s.push_str("Usage: rdwr_vn100 [--port PORT] [--baud BAUD] <command> [args]\n\n");
+    s.push_str("rw-vn100 - read/configure a VectorNav VN-100 over serial\n\n");
+    s.push_str("Usage: rw-vn100 [--port PORT] [--baud BAUD] <command> [args]\n\n");
 
     s.push_str("Commands:\n");
     s.push_str(&help_row(
@@ -275,17 +275,17 @@ pub fn help_text() -> String {
     s.push_str("      baud. Persist to keep it.\n\n");
 
     s.push_str("Examples:\n");
-    s.push_str("  rdwr_vn100 get-hz\n");
-    s.push_str("  rdwr_vn100 set-hz 40 --persist\n");
-    s.push_str("  rdwr_vn100 rrg 1                      # model number\n");
-    s.push_str("  rdwr_vn100 bench --bin --hz 200 --fields accel,gyro\n");
-    s.push_str("  rdwr_vn100 bench --hz 50              # ASCII async at 50 Hz\n");
+    s.push_str("  rw-vn100 get-hz\n");
+    s.push_str("  rw-vn100 set-hz 40 --persist\n");
+    s.push_str("  rw-vn100 rrg 1                      # model number\n");
+    s.push_str("  rw-vn100 bench --bin --hz 200 --fields accel,gyro\n");
+    s.push_str("  rw-vn100 bench --hz 50              # ASCII async at 50 Hz\n");
     s
 }
 
-/// The `name version` banner line, e.g. `rdwr_vn100 0.2.1`.
+/// The `name version` banner line, e.g. `rw-vn100 0.2.1`.
 pub fn version_line() -> String {
-    format!("rdwr_vn100 {}", env!("CARGO_PKG_VERSION"))
+    format!("rw-vn100 {}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Parse CLI args into a connection config and a command.

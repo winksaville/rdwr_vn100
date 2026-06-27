@@ -24,7 +24,7 @@ link — which reframes both the bug and the next step.
   baud switch read cleanly at 921600 — so the device UART can do
   it. Only the cross-process *reopen* over RS-232 wedges. Cause:
   see [RS-232 link analysis](#rs-232-link-analysis).
-- Next step: port `rdwr_vn100` to the RPi5 and re-run the baud
+- Next step: port `rw-vn100` to the RPi5 and re-run the baud
   climb on the TTL UART to test whether the wedge is RS-232-only.
   The tool is already portable (pure Rust + `serialport` crate);
   only the default `--port` (`/dev/ttyUSB0`, `main.rs:463`) is
@@ -35,7 +35,7 @@ link — which reframes both the bug and the next step.
 - On the Pi the IMU read path lives in existing Python (primary
   app `../fc/src/fc.py`, plus `../fc/scripts`). We do *not* need
   to port the whole app now, and we do *not* need the VectorNav
-  C++ SDK — `rdwr_vn100` already replaces it by talking the
+  C++ SDK — `rw-vn100` already replaces it by talking the
   VN-100 binary protocol directly in Rust. Near-term scope is
   just that: read the VN-100 from Rust over the Pi's TTL link.
   How it then feeds `fc.py` (IPC or a PyO3 module) is a later
@@ -138,7 +138,7 @@ tool maps it to the right register.
 
 ### Named states (file-backed) + default
 
-The `--config` file (default `./.rdwr_vn100-config.toml`, TOML,
+The `--config` file (default `./.rw-vn100-config.toml`, TOML,
 hand-editable) holds a map of named profiles plus a `default`
 key. Three verbs, three distinct jobs:
 
@@ -202,7 +202,7 @@ tests + clippy + a smoke run.
 
 Commits: [[4]]
 
-First contact with the VN-100 from `rdwr_vn100` on the RPi5 flight
+First contact with the VN-100 from `rw-vn100` on the RPi5 flight
 target succeeded over the 3.3 V TTL header UART (`/dev/ttyAMA0`,
 RP1 UART0 on GPIO14/15, `dtoverlay=uart0-pi5` loaded). ASCII paths
 work bare; binary output needed a fix and surfaced a real frame
@@ -230,7 +230,7 @@ in its first field (`asyncMode`): 1, 2, or 3 (both). ASCII async
 (registers 6/7) instead targets whichever port the config command
 arrived on, so it needs no port number and "just works" on the
 connected wire — which is why `get-hz` and the ASCII `bench`
-succeeded immediately. `rdwr_vn100` hardcodes `asyncMode=1`
+succeeded immediately. `rw-vn100` hardcodes `asyncMode=1`
 (`main.rs:1060`, `bench_binary`), which on the Pi's wire emits no
 binary at all.
 
@@ -362,14 +362,25 @@ The fix reorders `bench_binary`:
 - `bench_ascii` is unaffected: it has a single stream and already
   writes the message type (reg 6) before the rate (reg 7).
 
+## Rename rdwr_vn100 to rw-vn100
+
+Commits: 
+
+The renaming was because claude-code is converting the underscore to a
+a hypen so we endup with two ~/.claude/projects and claude isn't using
+our symlink to our /.claude repo.
+
+So in our /.claude repo commit there are "new" .jsonl that were not
+previously added.
+
 # References
 
 [1]: /notes/bugs.md#issue-1--high-baud-reconnect-can-wedge-the-vn-100-uart
 [2]: /notes/chores/chores-01.md#200-hz-binary-frame-budget-at-115200
-[3]: https://github.com/winksaville/rdwr_vn100/commit/656853ed17a2 "656853ed17a2c4a6f36b5e4cf9c1ca0dbaf0d570"
-[4]: https://github.com/winksaville/rdwr_vn100/commit/17d25b209c0c "17d25b209c0ca61aea3a8f84041bc7002226e78f"
-[5]: https://github.com/winksaville/rdwr_vn100/commit/49e72e583d47 "49e72e583d4787fb567357965081983d3ee9e60b"
-[6]: https://github.com/winksaville/rdwr_vn100/commit/ec6c523d4991 "ec6c523d499125093f5e9a3daac60e145dffaf40"
-[7]: https://github.com/winksaville/rdwr_vn100/commit/cb3c720fefdf "cb3c720fefdf078c21475698c0675117588e988a"
-[8]: https://github.com/winksaville/rdwr_vn100/commit/3e2c4983c744 "3e2c4983c744762a72dcfd4e3b670c6b0dc9e079"
+[3]: https://github.com/winksaville/rw-vn100/commit/656853ed17a2 "656853ed17a2c4a6f36b5e4cf9c1ca0dbaf0d570"
+[4]: https://github.com/winksaville/rw-vn100/commit/17d25b209c0c "17d25b209c0ca61aea3a8f84041bc7002226e78f"
+[5]: https://github.com/winksaville/rw-vn100/commit/49e72e583d47 "49e72e583d4787fb567357965081983d3ee9e60b"
+[6]: https://github.com/winksaville/rw-vn100/commit/ec6c523d4991 "ec6c523d499125093f5e9a3daac60e145dffaf40"
+[7]: https://github.com/winksaville/rw-vn100/commit/cb3c720fefdf "cb3c720fefdf078c21475698c0675117588e988a"
+[8]: https://github.com/winksaville/rw-vn100/commit/3e2c4983c744 "3e2c4983c744762a72dcfd4e3b670c6b0dc9e079"
 

@@ -1,6 +1,6 @@
 # VN-100 protocol reference (tool-scoped)
 
-The authoritative values `rdwr_vn100` relies on, with citations. **Scope:** only
+The authoritative values `rw-vn100` relies on, with citations. **Scope:** only
 what this tool touches — not the whole VN-100 protocol. For anything else, go to
 the primary sources directly.
 
