@@ -78,23 +78,19 @@ Design + module layout in chores-01 [[5]].
  detail goes in `notes/chores/chores-NN.md` design
  subsections (link via `[N]` ref).
 
-1. Fix passive `bench` intermittent zero-parse: it sometimes
-   reports `ASCII: none / Binary: none` then works on a re-run.
-   The symptom varies — full ~269 kbit/s in some failures, a low
-   ~24 kbit/s in another — so start by checking device state
-   (`get-bin` / `get-ascii` / `rrg 5`), then capture a real
-   failure via an env-gated raw dump and diff against the clean
-   `test-data/both-streams.bin`. [[8]]
-
-   Finding (2026-06-28): clean at 115200 — 40/40 fresh-open benches
-   on the rpi5/TTL, dual-stream (ASCII ypr 40 Hz + binary 200 Hz,
-   79% link), no reproduction. The symptom was seen on this same
-   rpi5/TTL rig (the ~269 kbit/s "none seen" runs can't fit a
-   115200 link — 269 kbit/s ≈ 29% of 921600 — so they were at a
-   higher baud). We think it's baud-dependent with a TTL crossover
-   above 115200, possibly sharing a high-baud root cause with the
-   RS-232 wedge (Bug #1). Next: chained baud sweep 115200 → 230400
-   → 460800 → 921600 to find the crossover.
+1. Fix passive `bench` intermittent zero-parse — bytes read off the
+   wire but zero parsed (`ASCII: none / Binary: none`). Root cause
+   confirmed 2026-06-28 (detail + captures in chores-01 [[8]]):
+   the RPi5 PL011 doesn't reliably apply the new baud divisor on a
+   fresh open when the open baud differs from the previous open, so
+   a cold 921600-after-115200 open intermittently reads either
+   stale-divisor (undersampled, ~24 kbit/s) or bit-misaligned (full
+   byte count, every CRC fails). Host-side, not the device (a
+   re-open clears it). Reproduced 4/20 warm and 2/20 from a cold
+   power-cycle by alternating `--baud`. Evidence + `repro.sh` in
+   `test-data/zero-parse/`. The fix: reopen-on-bad-open (measure
+   detects 0-valid / very-low throughput and reopens), or re-assert
+   the termios baud after open.
 
 2. `set-bin-fields+=<FIELDS>` / `set-bin-fields-=<FIELDS>`: OR-in /
    mask-out Common fields incrementally instead of restating the

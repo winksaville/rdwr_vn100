@@ -294,10 +294,12 @@ be measured as they actually run.
 
 ### Intermittent zero-parse (open)
 
-Passive `bench` intermittently reports `ASCII: none / Binary:
-none` then works on a re-run. **The symptom varies, so there may
-be more than one cause** — captured here so AM work starts from
-evidence, not a single theory. Tracked as a Todo.
+Passive `bench` intermittently reads bytes off the wire but parses
+**zero** of them into ASCII messages or binary frames — *zero-parse*
+— so it reports `ASCII: none / Binary: none`, then works on a
+re-run. **The symptom varies, so there may be more than one cause**
+— captured here so AM work starts from evidence, not a single
+theory. Tracked as a Todo.
 
 - **Full-throughput failures.** Twice (session start; a user run)
   it reported 0/0 at the *full* ~269 kbit/s — every byte read,
@@ -347,6 +349,58 @@ Next steps (AM):
 - Replace the circular synthetic interleave tests with
   real-fixture tests, and split `measure` into a clock-free scanner
   so the fixture tests run instantly.
+
+### Zero-parse root cause: PL011 baud-change open (confirmed 2026-06-28)
+
+Both modes above reproduced on the rpi5/TTL using the `--capture`
+flag (the AM `RWVN100_DUMP` idea, landed as `bench --capture
+<path>`). The recipe makes every measured open a baud *change*:
+alternate a `bench --baud 115200` (wrong baud — device at 921600)
+immediately before each `bench --baud 921600`. 4 of 20 such opens
+failed (20%); the streaming device never changed, and the next
+open always parsed clean.
+
+- **Full-misframe** (`test-data/zero-parse/misframe-fail.bin`) —
+  full ~26.9 KB read, frame-*shaped* (`fa 01 39 07` header and time
+  field in place) but values corrupted, so every CRC / checksum
+  fails and 0 parse. The "full ~269 kbit/s, none parsed" case.
+- **Low / stale divisor** (`test-data/zero-parse/stale-fail.bin`) —
+  ~2.2 KB read, no structure (1 `0xFA`, 3 `$` in the file): the
+  921600 open kept the stale 115200 divisor and undersampled the
+  stream 8×. The "~24 kbit/s after a wrong-baud open" case.
+
+`test-data/zero-parse/` holds each mode as a clean→fail→clean
+triplet (`*-before` / `*-fail` / `*-after`, every captured open
+preceded by a 115200 flip) plus `repro.sh`, the script that
+demonstrates it.
+
+It is host-side, not the device: the stream is continuous, only
+some opens fail, and a re-open clears it. We think the RPi5 PL011
+does not reliably apply the new baud divisor on a fresh open when
+the requested baud differs from the previous open's — sometimes
+leaving it stale (low), sometimes locking it bit-misaligned
+(full-misframe). This is why the old configure/measure bench was
+immune: its pre-measure `transact_retry` was a write→read that
+forced the divisor to settle (or failed loudly). The passive bench
+reads cold.
+
+Re-confirmed from cold: with the VN-100 power-cycled to flash
+defaults, `repro.sh` (default `START_BAUD=115200`) failed 2/20 (both
+full-misframe), so the symptom is not an artifact of session state.
+A config-phase `$VNERR 0x05` (not enough parameters) appeared on
+that run too — we think the same misalignment can also garble an
+*outgoing* command (TX side), not just passive reads, though that is
+unconfirmed.
+
+Fix direction (the remaining Todo):
+
+- **Reopen-on-bad-open** — `measure` detects 0 valid frames/lines
+  (or throughput far below the link) in an early window and
+  reopens the port, since a re-open clears it. Cheap, and matches
+  the observed recovery.
+- **Re-assert the baud after open** — force the termios divisor
+  before reading (a second `set_baud_rate` / `tcsetattr`), so a
+  cold open can't keep a stale or misaligned divisor.
 
 
 ## fix: binary output targets the wrong VN-100 serial port on TTL
