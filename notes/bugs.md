@@ -130,16 +130,31 @@ Two modes, both on a baud-change open:
   (~24 kbit/s). Framing broken.
 - **B6-flip** ("full-misframe" in the captures, but a misnomer —
   framing is intact). The divisor *does* apply: all frames present,
-  full byte count. But **bit 6 (B6)** flips on scattered bytes (set
-  on `0x2X/0x3X` data, cleared on `0xFA`), so every CRC / checksum
-  fails. XOR `0x40` recovers valid bytes. Why specifically B6 is
-  unexplained.
+  full byte count. But **bit 6 (B6)** flips on scattered bytes, so
+  every CRC / checksum fails. The flip follows a precise rule:
+  **b6 flips to 1 iff its predecessor bit b5 = 1** (~30 % of b5=1
+  bytes); we think the receiver samples the late data bits early and
+  latches b5 into b6. Confined to the high bits, framing intact, and
+  uniform across the stream — not boundary- or timing-correlated.
 
 Host-side, below the application — the tool does not transform the
 bytes. We think both are a marginal high-baud open at the UART layer.
-Reproduced 4/20 (warm) and 2/20 (cold VN-100 power-cycle) by
-alternating the open baud — captures + `repro.sh` in
-`test-data/zero-parse/`. The fix is tracked in `notes/todo.md`.
+Reproduced by alternating the open baud — captures + `repro.sh` /
+`scripts/repro-bw.sh` in `test-data/zero-parse/`.
+
+The fail *rate* scales with **link utilization** — the dominant
+factor (2026-06-28, `scripts/repro-bw.sh`, all 921600 baud-change
+opens; detail in chores-01 [[2]]):
+
+- Single-composition streams are clean at low rate (0/60 at ≤26 %)
+  but fail at high rate — bin-only 0/10 at 48 %, **3/10 at 95 %**.
+- Mixing aggravates: mixed fails ~11 % at 29 % and **35 % (14/40)
+  at 50 %**, where matched-bandwidth single streams are still ~0.
+- So higher utilization ⇒ higher fail rate; interleaving lowers the
+  threshold. The fc's **200 Hz bin-only @ 921600 (~24 %, single)**
+  sits in the low-risk corner (0/20 observed) — but treat 0/20 as
+  low, not zero, and use the work-around. The fix is tracked in
+  `notes/todo.md`.
 
 Sibling to **Issue #1** (same family — high-baud fresh opens on the
 rpi5) but a distinct failure: #1 wedges the *device* (silent, needs a

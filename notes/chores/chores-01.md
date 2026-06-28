@@ -367,13 +367,12 @@ always parsed clean. Registered as Bug #3.
   are present (tolerating a bit-6 flip on the header bytes recovers
   201 matches vs 130 for a strict `fa 01 39 07`), and CRLFs survive.
   The byte clock is right — instead, **bit 6 (B6)** flips
-  intermittently. A byte's bits are numbered 0..7 LSB-first, so B6
-  is the seventh. B6 is set on `0x2X/0x3X` data (`+`→`k`, digit→
-  lowercase) and cleared on `0xFA`→`0xBA`, so XOR `0x40` recovers
-  valid bytes, but over a ~110 B frame every CRC / checksum trips
-  and 0 parse. The "full ~269 kbit/s, none parsed" case. Not a
-  shifted/misaligned window (an earlier guess) — the divisor applied
-  correctly.
+  intermittently on scattered bytes, so over a ~110 B frame every
+  CRC / checksum trips and 0 parse. The "full ~269 kbit/s, none
+  parsed" case. Not a shifted/misaligned window (an earlier guess) —
+  the divisor applied correctly. The flip follows a precise rule,
+  measured later — see
+  [The b6←b5 rule](#the-b6b5-rule-b6-specificity-explained).
 - **Low / stale divisor** (`test-data/zero-parse/stale-fail.bin`) —
   ~2.2 KB read, no structure (1 `0xFA`, 3 `$` in the file): the
   921600 open kept the stale 115200 divisor and undersampled the
@@ -391,10 +390,11 @@ keeps the stale 115200 divisor, an 8× error that breaks framing.
 The **misframe** case is not — framing is intact and the byte clock
 is right, only B6 flips. We think both stem from a marginal
 high-baud open (the low case a wholly-unapplied divisor, the
-misframe case a sampling / signal-integrity glitch below the byte
-layer), but the **B6 specificity is unexplained** — a baud/clock
-error would smear across adjacent bits and break framing, which it
-does not. This is why the old configure/measure bench was immune:
+misframe case a sampling glitch below the byte layer). The
+**B6 specificity is now explained** by the b6←b5 rule below — a
+single late-bit effect, not a smear across adjacent bits, which is
+why framing survives. This is why the old configure/measure bench
+was immune:
 its pre-measure `transact_retry` was a write→read that forced a
 clean lock (or failed loudly). The passive bench reads cold.
 
@@ -409,18 +409,17 @@ unconfirmed.
 ### Host read-timing capture (jitter instrument)
 
 The raw `--capture` dump shows *what* corrupted but not the host-side
-timing around it, and the corruption rate varies with stream position
-(boundary frames flip more than mid-burst frames). To measure that,
-`--capture` now also writes a `<path>.timing` CSV sidecar — one
-`t_ns,offset` row per `read()`.
+timing around it. To test whether transport timing drives the
+corruption, `--capture` now also writes a `<path>.timing` CSV sidecar
+— one `t_ns,offset` row per `read()`.
 
 - Records when each read returned and where its bytes landed, so
   inter-read jitter and idle gaps are recoverable offline; the byte
   dump alone can't show them.
-- Targets the open question of whether an idle gap at the
-  ASCII→binary boundary drives the elevated boundary-frame flip rate.
-  We think the effect is a burst-restart-after-idle: the first frame
-  out of a gap samples worst.
+- Used to test whether an idle gap at the ASCII→binary boundary
+  drives corruption. Result: it does **not** — see
+  [The b6←b5 rule](#the-b6b5-rule-b6-specificity-explained). The
+  instrument earned its keep by *refuting* its own hypothesis.
 - It is host *delivery* time, not wire time — kernel tty / USB
   buffering batches reads, so it resolves ms-scale gaps, not bit-level
   timing.
@@ -431,6 +430,76 @@ time, not host arrival. `SerialCount` mode 2 (`SYNCIN_TIME`) was
 verified on the device to **not** free-run without a SyncIn source:
 with nothing on the SyncIn pin the appended `T` field stayed pinned
 at ~12 ms (11890–12081 µs), bouncing, never climbing.
+
+### The b6←b5 rule (B6 specificity explained)
+
+The B6 flip is not a smear: **b6 flips to 1 iff its predecessor bit
+b5 = 1.** Measured on the binary header's ground-truth bytes (truth
+`fa 01 39 07`): the `0x39` byte (b5=1) gains b6 ~30–34% of the time,
+while `0x01` and `0x07` (b5=0) never flip. Corruption is confined to
+the high data bits (b6, b7); b0–b5 are untouched.
+
+- We think the receiver samples the *late* data bits too early, so by
+  b6 the sample point has drifted into b5's window and b6 latches
+  b5's level — a sampling-clock / baud error from the marginal open,
+  not a logic bug (`read()` hands us already-framed bytes, so the
+  corruption is at or below the kernel UART).
+- It explains the anomalies: a payload `0xBA` (b5=1, b6=0) becomes
+  `0xFA`, and the boundary bytes `0d 0a fa 01` are immune because
+  they are all b5=0.
+
+The corruption is **session-wide, uniform, and all-or-nothing.** A
+bad open flips ~30% of b5=1 bytes evenly across the whole stream; a
+clean open is *exactly* 0%. It is **not** correlated with boundary
+position or per-read timing — the read-timing instrument showed
+flipped and non-flipped frames have identical idle-before across
+three cleanly-bracketed fails. The earlier "boundary frames flip
+more (48% vs 34%)" was small-n noise; it did not reproduce.
+
+- Evidence: `test-data/zero-parse/timing-run-2/` holds two
+  before/fail/after triplets (`t1-*`, `t2-*`) with `.timing`
+  sidecars.
+- Implication: the all-or-nothing property means a bad open is
+  detectable from a tiny early window (any CRC fail in the first few
+  frames ⇒ the whole open is poisoned), which validates the
+  reopen-and-retry fix below.
+
+### Bandwidth dependence (the dominant factor)
+
+The bad-open fail *rate* scales with link utilization — measured
+2026-06-28 with `scripts/repro-bw.sh` (all 921600 baud-change opens,
+varying the stream rate / composition):
+
+| stream | % link | fails |
+|---|---|---|
+| single-composition, ≤26 % | ≤26 % | 0/60 |
+| bin-only @ 400 Hz | 48 % | 0/10 |
+| mixed @ 29 % (bin200 + ascii40) | 29 % | ~11 % (9/80) |
+| bin-only @ 800 Hz | 95 % | 3/10 |
+| mixed @ 50 % (bin200 + ascii200) | 50 % | 14/40 |
+
+- **Bandwidth is primary.** Single-composition is *not* immune —
+  bin-only goes 0 (≤48 %) → 30 % (95 %). The earlier "0/60
+  single-composition" was all ≤26 %, i.e. low on the curve, not
+  evidence of immunity.
+- **Mixing is a secondary aggravator.** At matched ~50 %, mixed
+  fails 35 % while bin-only@48 % is 0/10; mixed@29 % already fails
+  ~11 % where single streams are clean. So interleaving lowers the
+  bandwidth threshold rather than being the cause.
+- We think higher utilization leaves the RX UART less idle for the
+  marginal divisor to settle after the baud-change open (or worsens
+  signal integrity under sustained activity), so it mis-locks more
+  often. Inferred, not proven.
+- Caveat: the high-BW single points are N=10 (wide error bars). The
+  qualitative result (single-composition fails at high BW) is solid;
+  the exact rates and the threshold are not pinned.
+- Evidence: representative fail/clean captures (with `.timing`) in
+  `test-data/zero-parse/compose/` — `mixed-50pct`, `binonly-95pct`,
+  `binonly-48pct`; full sweeps reproduce via `scripts/repro-bw.sh`.
+
+**fc implication:** 200 Hz bin-only @ 921600 (~24 %, single
+composition) is the low-risk corner (0/20 observed). Low, not zero —
+pair it with the reopen-and-retry work-around below.
 
 Fix direction (the remaining Todo):
 

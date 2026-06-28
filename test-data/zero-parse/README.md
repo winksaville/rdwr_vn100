@@ -11,7 +11,9 @@ corrupts the read in two modes: the new divisor never applies (stale,
 undersampled garbage), or — framing intact and the byte clock right —
 bit 6 (B6) flips on scattered bytes so every CRC fails (bits are
 numbered 0..7 LSB-first, so B6 is the seventh). We think both are a
-marginal high-baud open. The B6 specificity is unexplained.
+marginal high-baud open. The B6 flip follows a precise rule: b6 flips
+to 1 iff bit b5 = 1 (see chores-01), and is uniform across the stream
+— not boundary- or timing-correlated.
 
 ## `repro.sh`
 
@@ -36,6 +38,15 @@ Raw `bench --capture` dumps — the bytes the scanner saw. Diff a
   is ~2.2 KB, undersampled garbage (~24 kbit/s); before/after clean.
 - `cold-misframe-{1,2}.bin` — the two failures from the cold-start
   reproduction below.
+- `timing-run-2/{t1,t2}-{before,fail,after}.bin` (+ `.bin.timing`) —
+  two B6-flip triplets captured with the per-read timing sidecar.
+  Each `t?-fail` is bracketed by a clean `-before` and `-after`. The
+  `.timing` files (per-read `t_ns,offset`) show the flip is uniform
+  and *not* timing/boundary-correlated.
+- `compose/{mixed-50pct,binonly-95pct,binonly-48pct}/` — bandwidth
+  sweep evidence (fail/clean pairs + `.timing`): the zero-parse fail
+  rate scales with link utilization (chores-01 bandwidth section).
+  Reproduce with `scripts/repro-bw.sh`.
 
 ## Reproductions
 
@@ -47,3 +58,9 @@ Raw `bench --capture` dumps — the bytes the scanner saw. Diff a
   config-phase `$VNERR 0x05` (not enough parameters) also appeared.
   We think the same corruption can garble an *outgoing* command (TX
   side), not just passive reads — unconfirmed.
+- **Timing** (warm, new build with the `.timing` sidecar),
+  `repro.sh <out> 20 921600` ×2: failed 1/20 then 2/20. The two
+  cleanly-bracketed fails are `timing-run-2/`. Across three fails
+  (these two plus an earlier one) the b6-flip rate is ~30–34% on
+  b5=1 bytes, uniform over the stream, with identical idle-before for
+  flipped vs non-flipped frames — so it is not boundary/timing-driven.

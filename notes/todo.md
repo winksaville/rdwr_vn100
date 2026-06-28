@@ -80,21 +80,31 @@ Design + module layout in chores-01 [[5]].
 
 1. Fix passive `bench` intermittent zero-parse (Bug #3) — bytes read
    off the wire but zero parsed (`ASCII: none / Binary: none`). Root
-   cause confirmed 2026-06-28 (detail + captures in chores-01 [[8]]):
-   a marginal 921600-after-115200 open (open baud differs from the
-   previous open) intermittently corrupts the read in one of two
-   modes — stale-divisor (the new divisor never applied, an 8×
-   undersample, ~24 kbit/s) or B6-flip (framing intact, byte clock
-   right, but bit 6 flips on scattered bytes so every CRC fails —
-   not a shifted window). Host-side, not the device (a
-   re-open clears it). Reproduced 4/20 warm and 2/20 from a cold
-   power-cycle by alternating `--baud`. Evidence + `repro.sh` in
+   cause (detail + captures in chores-01 [[8]]): a marginal 921600
+   baud-change open intermittently corrupts the read — either
+   stale-divisor (8× undersample, ~24 kbit/s) or B6-flip (framing
+   intact; b6 flips iff predecessor b5=1, so every CRC fails).
+   Host-side, not the device (a re-open clears it), and the fault is
+   all-or-nothing (a bad open is ~30 % corrupt, a clean one exactly
+   0 %). The fail *rate* scales with link utilization (single
+   0/60 ≤26 % → bin-only 3/10 at 95 %; mixing aggravates); fc's
+   200 Hz bin-only @ 921600 (~24 %) is the low-risk corner — low, not
+   zero. Evidence + `repro.sh` / `scripts/repro-bw.sh` in
    `test-data/zero-parse/`. The fix is a work-around (the PL011 cause
-   is below the tool): reopen-and-retry until a clean read (bounded N
-   — one reopen can itself be a bad baud-change), or re-assert the
-   termios baud after open (stale case only).
+   is below the tool): detect a bad open (any CRC fail in an early
+   window — cheap, since it's all-or-nothing) and reopen-and-retry
+   until clean (bounded N — one reopen can itself be a bad
+   baud-change), or re-assert the termios baud after open (stale case
+   only).
 
-2. `set-bin-fields+=<FIELDS>` / `set-bin-fields-=<FIELDS>`: OR-in /
+2. Pin the zero-parse bandwidth threshold (Bug #3 follow-up) — the
+   fail rate rises with link utilization, but the high-BW
+   single-composition points are only N=10. Firm them up (more
+   opens), run a finer sweep to locate the threshold, and test
+   whether other baud-change *targets* (460800, 230400) fail or only
+   921600. Use `scripts/repro-bw.sh`. Detail in chores-01 [[8]].
+
+3. `set-bin-fields+=<FIELDS>` / `set-bin-fields-=<FIELDS>`: OR-in /
    mask-out Common fields incrementally instead of restating the
    whole set. The set-arithmetic generalizes to the other bitmask
    registers — Binary Output 2/3 (regs 76/77, identical layout)
