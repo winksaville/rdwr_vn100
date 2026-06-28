@@ -391,8 +391,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             print_reg_fields(&reply);
         }
 
-        Command::Bench { secs } => {
-            bench(&mut port, config.baud, secs)?;
+        Command::Bench { secs, capture } => {
+            bench(&mut port, config.baud, secs, capture)?;
         }
 
         Command::FactoryReset => {

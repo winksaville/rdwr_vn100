@@ -8,6 +8,8 @@
 //!   a count of every byte off the wire for total throughput.
 //! - Passive means the binary frame length is unknown up front, so each frame
 //!   is sniffed from its own header (`try_common_frame`) rather than a config.
+//! - `--capture <path>` dumps every byte read to `<path>` (collected in
+//!   memory, written at exit) for offline diffing. Omitted → no behavior change.
 
 use std::io::{ErrorKind, Read};
 use std::time::{Duration, Instant};
@@ -343,19 +345,58 @@ fn report(baud: u32, st: &Stats) {
     );
 }
 
+/// A `Read` adapter that records every byte it passes through.
+///
+/// - Backs the `RW_VN100_CAPTURE` raw dump: the recorded bytes are exactly
+///   what the scanner saw, so the dump diffs directly against a known-good
+///   capture (e.g. `test-data/both-streams.bin`).
+/// - `inner` is the real port; `sink` accumulates the bytes in memory.
+struct CaptureReader<'a, S: Read> {
+    inner: &'a mut S,
+    sink: Vec<u8>,
+}
+
+impl<S: Read> Read for CaptureReader<'_, S> {
+    /// Read from `inner`, appending the bytes returned to `sink`.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.sink.extend_from_slice(&buf[..n]);
+        Ok(n)
+    }
+}
+
 /// Passively measure the device's live output for `secs` seconds.
 ///
 /// - Does no device writes — reports whatever is already streaming.
 /// - Counts ASCII `$VN` async lines and binary `0xFA` Common-group frames
 ///   (CRC-checked) over the same bytes, plus total wire throughput against the
 ///   `baud` link.
+/// - `capture` (the `--capture <path>` flag) set → records every raw byte read
+///   into memory and writes it to `<path>` at the end. `None` → read path
+///   unchanged.
 pub fn bench<S: Read>(
     port: &mut S,
     baud: u32,
     secs: u64,
+    capture: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Measuring the live stream for {secs}s (passive — no device writes)...");
-    let st = measure(port, secs)?;
+    let st = if let Some(path) = capture {
+        // Preallocate the link's physical ceiling for the window so the read
+        // loop never reallocates: baud/10 bytes/s (8N1 = 10 bits/byte) × secs,
+        // plus one read buffer for the final partial read past the deadline.
+        let cap_est = ((baud as usize / 10) * secs as usize) + 1024;
+        let mut cap = CaptureReader {
+            inner: port,
+            sink: Vec::with_capacity(cap_est),
+        };
+        let st = measure(&mut cap, secs)?;
+        std::fs::write(&path, &cap.sink)?;
+        println!("Captured {} raw bytes to {path}.", cap.sink.len());
+        st
+    } else {
+        measure(port, secs)?
+    };
     report(baud, &st);
     if st.msgs == 0 && st.frames == 0 {
         return Err(
@@ -413,6 +454,23 @@ mod tests {
             data.extend_from_slice(ascii.as_bytes());
         }
         data
+    }
+
+    #[test]
+    fn capture_reader_records_every_byte() {
+        let data = interleaved_stream(2);
+        let mut mock = MockReader {
+            data: data.clone(),
+            pos: 0,
+            chunk: 7, // split the stream across reads
+        };
+        let mut cap = CaptureReader {
+            inner: &mut mock,
+            sink: Vec::new(),
+        };
+        let mut buf = [0u8; 16];
+        while cap.read(&mut buf).unwrap() != 0 {}
+        assert_eq!(cap.sink, data);
     }
 
     #[test]

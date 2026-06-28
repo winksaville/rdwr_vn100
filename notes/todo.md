@@ -86,6 +86,16 @@ Design + module layout in chores-01 [[5]].
    failure via an env-gated raw dump and diff against the clean
    `test-data/both-streams.bin`. [[8]]
 
+   Finding (2026-06-28): clean at 115200 — 40/40 fresh-open benches
+   on the rpi5/TTL, dual-stream (ASCII ypr 40 Hz + binary 200 Hz,
+   79% link), no reproduction. The symptom was seen on this same
+   rpi5/TTL rig (the ~269 kbit/s "none seen" runs can't fit a
+   115200 link — 269 kbit/s ≈ 29% of 921600 — so they were at a
+   higher baud). We think it's baud-dependent with a TTL crossover
+   above 115200, possibly sharing a high-baud root cause with the
+   RS-232 wedge (Bug #1). Next: chained baud sweep 115200 → 230400
+   → 460800 → 921600 to find the crossover.
+
 2. `set-bin-fields+=<FIELDS>` / `set-bin-fields-=<FIELDS>`: OR-in /
    mask-out Common fields incrementally instead of restating the
    whole set. The set-arithmetic generalizes to the other bitmask

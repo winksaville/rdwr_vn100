@@ -145,6 +145,8 @@ pub enum Command {
     /// Common-group frame rate, and total wire throughput.
     Bench {
         secs: u64,
+        /// Raw-capture path from `--capture`; dumps every wire byte read.
+        capture: Option<String>,
     },
 }
 
@@ -235,6 +237,7 @@ pub fn help_text() -> String {
             "Passively measure whatever is already streaming",
             "(default 5 s) — no device writes. Reports ASCII",
             "line rate, binary frame rate, and wire throughput.",
+            "`--capture <path>` dumps raw wire bytes.",
         ],
     ));
     s.push_str(&help_row(
@@ -265,6 +268,10 @@ pub fn help_text() -> String {
     s.push_str(&help_row(
         "--persist",
         &["Save to flash so it survives a power cycle (set-hz, baud)."],
+    ));
+    s.push_str(&help_row(
+        "--capture <path>",
+        &["Dump raw wire bytes to <path> (bench only)."],
     ));
 
     s.push_str(&format!(
@@ -324,6 +331,7 @@ pub fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Comman
     let mut port = "/dev/ttyAMA0".to_string();
     let mut baud = 115_200u32;
     let mut persist = false;
+    let mut capture: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut args = args.into_iter();
@@ -338,6 +346,7 @@ pub fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Comman
                     .map_err(|_| "--baud must be a number")?
             }
             "--persist" => persist = true,
+            "--capture" => capture = Some(args.next().ok_or("--capture requires a path")?),
             _ => positional.push(arg),
         }
     }
@@ -353,6 +362,12 @@ pub fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Comman
         },
         None => (None, None),
     };
+
+    // `--capture` is bench-only. Each non-`set-*` verb rejects `--persist`
+    // per-arm, but bench is `--capture`'s lone consumer, so one check covers it.
+    if capture.is_some() && verb != Some("bench") {
+        return Err("--capture applies to `bench`, not other verbs".into());
+    }
 
     let command = match verb {
         Some("get-ascii") => {
@@ -470,7 +485,7 @@ pub fn parse_args<I: Iterator<Item = String>>(args: I) -> Result<(Config, Comman
                 })?,
                 None => 5,
             };
-            Command::Bench { secs }
+            Command::Bench { secs, capture }
         }
         Some(other) => return Err(format!("unknown command `{other}`")),
         None => {
@@ -630,16 +645,45 @@ mod tests {
 
     #[test]
     fn parses_bench_passive() {
-        // Bare bench defaults to 5 s.
+        // Bare bench defaults to 5 s, no capture.
         let (_, c) = parse_args(["bench"].into_iter().map(String::from)).unwrap();
-        assert!(matches!(c, Command::Bench { secs: 5 }));
+        assert!(matches!(
+            c,
+            Command::Bench {
+                secs: 5,
+                capture: None
+            }
+        ));
         // Positional SECS.
         let (_, c) = parse_args(["bench", "10"].into_iter().map(String::from)).unwrap();
-        assert!(matches!(c, Command::Bench { secs: 10 }));
+        assert!(matches!(c, Command::Bench { secs: 10, .. }));
         // Non-numeric duration is rejected.
         assert!(parse_args(["bench", "abc"].into_iter().map(String::from)).is_err());
         // bench takes at most one argument — it is passive and configures nothing.
         assert!(parse_args(["bench", "1", "2"].into_iter().map(String::from)).is_err());
+        // --capture attaches a path to bench.
+        let (_, c) = parse_args(
+            ["bench", "--capture", "/tmp/x.bin"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert!(matches!(
+            c,
+            Command::Bench {
+                secs: 5,
+                capture: Some(_)
+            }
+        ));
+        // --capture is bench-only.
+        assert!(
+            parse_args(
+                ["get-bin", "--capture", "/tmp/x.bin"]
+                    .into_iter()
+                    .map(String::from)
+            )
+            .is_err()
+        );
     }
 
     #[test]
