@@ -167,8 +167,8 @@ pub fn help_text() -> String {
     s.push_str("Usage: rw-vn100 [--port PORT] [--baud BAUD] <command> [args]\n\n");
 
     s.push_str("Commands:\n");
-    s.push_str("  Output config — each verb owns one register; `--persist` on a\n");
-    s.push_str("  `set-*` writes flash. Bare `set-bin` re-enables the current mask.\n");
+    s.push_str("  The output-config verbs each own one register. Adding `--persist`\n");
+    s.push_str("  on a `set-*` causes the register to be written to flash.\n\n");
     s.push_str(&help_row(
         "get-ascii",
         &["Read the ASCII async preset (register 6)."],

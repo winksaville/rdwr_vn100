@@ -265,14 +265,24 @@ entries use a sharper form of the same shape:
     formalized only when the entry is picked up into a
     cycle.
 
-### Semicolons inside bullets
+### Semicolons
 
-A bullet that joins multiple clauses with semicolons (`A; B; C`)
-is a list hiding inside running prose — break the clauses into
-sub-bullets so the structure shows. Semicolons in running prose
-(intro paragraphs, sentence-joins) are fine. Not absolute: very
-short clauses or tight pairs can stay joined inside a bullet when
-breaking would be more noise than signal.
+A semicolon that splices a detail onto a notion without adding
+information just fragments the sentence, and the split reads as a
+boundary that invites a misread. Two surfaces, two remedies:
+
+- **Inside a bullet** — a bullet joining multiple clauses with
+  semicolons (`A; B; C`) is a list hiding inside running prose.
+  Break the clauses into indented sub-bullets so the structure
+  shows.
+- **In running prose** (intro paragraphs, doc comments, help text,
+  commit bodies) there is no sub-bullet to demote into. Use a
+  plain sentence break — a period — instead, or restructure when
+  the detail genuinely subordinates.
+
+Not absolute: a true sentence-join of two closely related
+independent clauses, or a very short tight pair inside a bullet,
+can stay joined when breaking would be more noise than signal.
 
 ### Conventional-commit shape (ladder / chores / commit)
 

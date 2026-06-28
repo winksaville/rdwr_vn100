@@ -86,6 +86,25 @@ Design + module layout in chores-01 [[5]].
    failure via an env-gated raw dump and diff against the clean
    `test-data/both-streams.bin`. [[8]]
 
+2. Decompose `set-bin` (and `set-ascii`) into orthogonal verbs:
+   a field/preset write that never toggles streaming, plus
+   explicit `=on` / `=off`. Today `set-bin=<fields>` secretly
+   enables output too, conflating "what fields" with "whether it
+   streams". Lands with the step grammar so a single line —
+   `set-bin=time,ypr set-ascii=off set-bin=on` — reads
+   declaratively. Pin down on the way: `=on` defaults to port 2,
+   an empty-mask guard before `=on`, and bare `set-bin` as an
+   `=on` alias. [[1]]
+
+3. `set-bin+=<fields>` / `set-bin-=<fields>`: OR-in / mask-out
+   Common fields incrementally instead of restating the whole
+   set. The set-arithmetic generalizes to the other bitmask
+   registers — Binary Output 2/3 (regs 76/77, identical layout)
+   and reg 75's `asyncMode` serial-port mask — but not to
+   `set-ascii` (reg 6 is a single-valued preset, so only
+   `=on`/`=off` fits there). Builds on the orthogonal `set-bin`
+   verbs. [[1]]
+
 ## Done
 
 Completed tasks are moved from `## Todo` to here, `## Done`, as they are completed
